@@ -226,15 +226,29 @@ function parseTranscriptLine(line) {
     return {
       role: typeof role === "string" ? role : "unknown",
       text: text.trim(),
-      timestamp: typeof timestamp === "number" ? timestamp : undefined,
+      timestamp: toTimestampMs(timestamp),
     };
   } catch {
     return null;
   }
 }
 
-function readLastMessagePreview(sessionFile, maxChars = 96) {
-  if (!sessionFile || !fs.existsSync(sessionFile)) return "";
+function toTimestampMs(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function readTranscriptSummary(sessionFile, maxChars = 96) {
+  const empty = {
+    createdAt: undefined,
+    lastMessageAt: undefined,
+    lastMessagePreview: "",
+  };
+  if (!sessionFile || !fs.existsSync(sessionFile)) return empty;
   try {
     const stat = fs.statSync(sessionFile);
     const readBytes = Math.min(stat.size, 64 * 1024);
@@ -242,16 +256,30 @@ function readLastMessagePreview(sessionFile, maxChars = 96) {
     const buffer = Buffer.alloc(readBytes);
     fs.readSync(fd, buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
     fs.closeSync(fd);
-    const lines = buffer.toString("utf8").trim().split(/\r?\n/).reverse();
-    for (const line of lines) {
+    const text = buffer.toString("utf8").trim();
+    const lines = text ? text.split(/\r?\n/) : [];
+    let createdAt;
+    if (stat.size <= readBytes && lines[0]) {
+      try {
+        const first = JSON.parse(lines[0]);
+        createdAt = toTimestampMs(first.timestamp ?? first.createdAt ?? first.ts);
+      } catch {
+        createdAt = undefined;
+      }
+    }
+    for (const line of [...lines].reverse()) {
       const msg = parseTranscriptLine(line);
       if (!msg || !SEARCHABLE_ROLES.has(msg.role)) continue;
-      return `${roleLabel(msg.role)}：${singleLine(msg.text, maxChars)}`;
+      return {
+        createdAt,
+        lastMessageAt: msg.timestamp,
+        lastMessagePreview: `${roleLabel(msg.role)}：${singleLine(msg.text, maxChars)}`,
+      };
     }
   } catch {
-    return "";
+    return empty;
   }
-  return "";
+  return empty;
 }
 
 function normalizeSessionLabel(value) {
@@ -282,7 +310,7 @@ function listResumableSessions(agentId, cfg, params = {}) {
     ...session,
     label: normalizeSessionLabel(session.label),
     displayName: sessionDisplayName(session),
-    lastMessagePreview: readLastMessagePreview(session.sessionFile),
+    ...readTranscriptSummary(session.sessionFile),
   }));
   return { sessions, stats: listed.stats };
 }
@@ -395,6 +423,8 @@ function searchTranscriptNode(session, terms, opts) {
       label: session.label,
       sessionId: session.sessionId,
       updatedAt: session.updatedAt,
+      createdAt: session.createdAt,
+      lastMessageAt: session.lastMessageAt,
       role: msg.role,
       line: i + 1,
       timestamp: msg.timestamp,
@@ -500,6 +530,8 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
       label: session.label,
       sessionId: session.sessionId,
       updatedAt: session.updatedAt,
+      createdAt: session.createdAt,
+      lastMessageAt: session.lastMessageAt,
       role: msg.role,
       line: Number(event.data?.line_number || 0),
       timestamp: msg.timestamp,
@@ -533,6 +565,15 @@ async function searchWithRg(sessions, terms, opts) {
     if (hits.length >= opts.limit * 8 || timedOut || failed) break;
   }
   return { hits, meta: { backend: "rg", rgCommand, timedOut, failed, stderr } };
+}
+
+function attachTranscriptSummaries(sessions) {
+  return sessions.map((session) => ({
+    ...session,
+    label: normalizeSessionLabel(session.label),
+    displayName: sessionDisplayName(session),
+    ...readTranscriptSummary(session.sessionFile),
+  }));
 }
 
 function searchWithNode(sessions, terms, opts) {
@@ -657,14 +698,18 @@ function formatNamedSessionsReply(sessions, stats) {
   sessions.slice(0, 20).forEach((session, index) => {
     lines.push(`--- ${index + 1}/${Math.min(sessions.length, 20)} ---`);
     lines.push(`会话：${singleLine(session.displayName || sessionDisplayName(session), 80)}`);
-    if (!session.label && session.key) lines.push(`类型：未命名会话，可用 key 恢复`);
-    const when = formatTime(session.updatedAt);
-    if (when) lines.push(`时间：${when}`);
+    if (session.key && session.key !== session.displayName) {
+      lines.push(`恢复ID：${singleLine(session.key, 96)}`);
+    }
+    const created = formatTime(session.createdAt);
+    const last = formatTime(session.lastMessageAt || session.updatedAt);
+    if (created) lines.push(`创建：${created}`);
+    if (last) lines.push(`最近交流：${last}`);
     if (session.lastMessagePreview) lines.push(`最近：${singleLine(session.lastMessagePreview, 120)}`);
     lines.push("");
   });
-  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话名或 key。`);
-  lines.push("使用：/resume <会话名或 session key>");
+  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话或恢复ID。`);
+  lines.push("使用：/resume <会话或恢复ID>");
   return lines.join("\n");
 }
 
@@ -672,7 +717,7 @@ function formatResumeSuccessReply(session, binding) {
   return [
     `已恢复会话：${session.displayName || sessionDisplayName(session)}`,
     "",
-    `目标：${session.key}`,
+    `恢复ID：${session.key}`,
     binding?.bindingId ? `绑定：${binding.bindingId}` : "",
     "后续消息会继续进入这个会话。",
   ]
@@ -829,11 +874,14 @@ function formatSessionSearchCommandReply(result) {
   }
   lines.push("");
   result.results.forEach((item, index) => {
-    const when = formatTime(item.updatedAt);
+    const hitTime = formatTime(item.timestamp);
+    const lastTime = formatTime(item.lastMessageAt || item.updatedAt);
     const label = item.label || item.key || item.sessionId || "session";
     lines.push(`--- ${index + 1}/${result.results.length} ---`);
     lines.push(`会话：${singleLine(label, 56)}`);
-    if (when) lines.push(`时间：${when}`);
+    if (item.key && item.key !== label) lines.push(`恢复ID：${singleLine(item.key, 96)}`);
+    if (hitTime) lines.push(`命中时间：${hitTime}`);
+    if (lastTime && lastTime !== hitTime) lines.push(`最近交流：${lastTime}`);
     lines.push(`角色：${roleLabel(item.role)}`);
     lines.push(`片段：${cleanDisplaySnippet(item.snippet, result.query)}`);
     lines.push("");
@@ -882,6 +930,7 @@ async function sessionSearch(params, cfg) {
     maxFiles,
     sessionsDir: sessionsDirForAgent(agentId),
   });
+  const selectedSessions = attachTranscriptSummaries(selected.sessions);
   const searchOpts = {
     limit,
     includeAssistant,
@@ -892,14 +941,19 @@ async function sessionSearch(params, cfg) {
   };
   let search =
     cfg.backend === "rg"
-      ? await searchWithRg(selected.sessions, terms, searchOpts)
-      : searchWithNode(selected.sessions, terms, searchOpts);
+      ? await searchWithRg(selectedSessions, terms, searchOpts)
+      : searchWithNode(selectedSessions, terms, searchOpts);
   if (search.meta.failed && cfg.fallbackToNode) {
-    search = searchWithNode(selected.sessions, terms, searchOpts);
+    search = searchWithNode(selectedSessions, terms, searchOpts);
     search.meta.fallbackFrom = "rg";
   }
   const results = search.hits
-    .sort((a, b) => b.score - a.score || b.updatedAt - a.updatedAt)
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
+          Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
+    )
     .slice(0, limit);
   return {
     query,

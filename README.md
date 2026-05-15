@@ -54,7 +54,14 @@ The plugin also implements the named-session resume behavior from OpenClaw PR 82
 /resume resume-test-alpha
 ```
 
-`/resume` lists user-visible resumable sessions. `/resume <session-label-or-key>` resolves an exact session label first, then an exact session key, and binds the current conversation to that session through OpenClaw's session binding service. This command is deterministic and does not call a model.
+`/resume` lists user-visible resumable sessions. The display uses:
+
+- `会话`: human-readable label when available, otherwise the session key.
+- `恢复ID`: the stable session key that can always be passed back to `/resume`.
+- `创建`: transcript creation time when available.
+- `最近交流`: latest user/assistant/system transcript message time.
+
+`/resume <session-label-or-key>` resolves an exact session label first, then an exact session key, and binds the current conversation to that session through OpenClaw's session binding service. This command is deterministic and does not call a model.
 
 ## Configuration
 
