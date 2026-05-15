@@ -489,22 +489,36 @@ function singleLine(value, maxChars) {
   return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function roleLabel(role) {
+  if (role === "user") return "用户";
+  if (role === "assistant") return "助手";
+  if (role === "system") return "系统";
+  return role || "未知";
+}
+
 function formatSessionSearchCommandReply(result) {
+  const filtered =
+    result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal;
   const lines = [
-    `Session search: ${result.query}`,
-    `backend=${result.backend}, results=${result.count}, searched=${result.searchedFiles}/${result.candidateSessions}, filtered=${result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal}, took=${result.tookMs}ms`,
+    `历史会话搜索：${result.query}`,
+    "",
+    `结果：${result.count} 条`,
+    `范围：搜索 ${result.searchedFiles} 个可见会话，过滤 ${filtered} 个内部会话`,
+    `耗时：${result.tookMs}ms (${result.backend})`,
   ];
   if (!Array.isArray(result.results) || result.results.length === 0) {
-    lines.push("No matching user-visible sessions found.");
+    lines.push("", "未找到匹配的用户可见会话。");
     return lines.join("\n");
   }
   lines.push("");
   result.results.forEach((item, index) => {
     const when = formatTime(item.updatedAt);
     const label = item.label || item.key || item.sessionId || "session";
-    const role = item.role || "unknown";
-    lines.push(`${index + 1}. ${singleLine(label, 80)}${when ? ` (${when})` : ""}`);
-    lines.push(`   ${role}: ${singleLine(item.snippet, 180)}`);
+    lines.push(`${index + 1}. ${singleLine(label, 60)}`);
+    if (when) lines.push(`   时间：${when}`);
+    lines.push(`   角色：${roleLabel(item.role)}`);
+    lines.push(`   片段：${singleLine(item.snippet, 120)}`);
+    if (index < result.results.length - 1) lines.push("");
   });
   return lines.join("\n");
 }
@@ -704,6 +718,7 @@ export default definePluginEntry({
             agentId: "main",
             sinceDays: cfg.sinceDays,
             limit: Math.min(cfg.defaultLimit, 5),
+            maxChars: 240,
             includeAssistant: cfg.includeAssistantByDefault,
           },
           cfg,
