@@ -468,6 +468,47 @@ function searchWithNode(sessions, terms, opts) {
   };
 }
 
+function formatTime(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  try {
+    return new Date(n).toLocaleString("zh-CN", {
+      timeZone: "Asia/Shanghai",
+      hour12: false,
+    });
+  } catch {
+    return new Date(n).toISOString();
+  }
+}
+
+function singleLine(value, maxChars) {
+  const text = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function formatSessionSearchCommandReply(result) {
+  const lines = [
+    `Session search: ${result.query}`,
+    `backend=${result.backend}, results=${result.count}, searched=${result.searchedFiles}/${result.candidateSessions}, filtered=${result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal}, took=${result.tookMs}ms`,
+  ];
+  if (!Array.isArray(result.results) || result.results.length === 0) {
+    lines.push("No matching user-visible sessions found.");
+    return lines.join("\n");
+  }
+  lines.push("");
+  result.results.forEach((item, index) => {
+    const when = formatTime(item.updatedAt);
+    const label = item.label || item.key || item.sessionId || "session";
+    const role = item.role || "unknown";
+    lines.push(`${index + 1}. ${singleLine(label, 80)}${when ? ` (${when})` : ""}`);
+    lines.push(`   ${role}: ${singleLine(item.snippet, 180)}`);
+  });
+  return lines.join("\n");
+}
+
 async function sessionSearch(params, cfg) {
   const startedAt = Date.now();
   const query = typeof params.query === "string" ? params.query.trim() : "";
@@ -642,5 +683,33 @@ export default definePluginEntry({
       },
       { name: "session_search" },
     );
+
+    api.registerCommand({
+      name: "session-search",
+      description: "Search user-visible OpenClaw session transcripts",
+      acceptsArgs: true,
+      requireAuth: true,
+      async handler(ctx) {
+        const query = typeof ctx.args === "string" ? ctx.args.trim() : "";
+        if (!query) {
+          return { text: "Usage: /session-search <keyword>" };
+        }
+        const cfg = resolveConfig(api.pluginConfig);
+        if (!cfg.enabled) {
+          return { text: "Session search is disabled." };
+        }
+        const result = await sessionSearch(
+          {
+            query,
+            agentId: "main",
+            sinceDays: cfg.sinceDays,
+            limit: Math.min(cfg.defaultLimit, 5),
+            includeAssistant: cfg.includeAssistantByDefault,
+          },
+          cfg,
+        );
+        return { text: formatSessionSearchCommandReply(result) };
+      },
+    });
   },
 });

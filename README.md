@@ -6,6 +6,7 @@ The plugin exposes:
 
 - Gateway RPC: `session-search.search`
 - Tool: `session_search`
+- Slash command: `/session-search <keyword>`
 
 It searches recent user-visible session transcripts with `rg` when available, with a deterministic Node.js fallback. It does not call a model and does not depend on the configured memory slot.
 
@@ -34,6 +35,14 @@ openclaw gateway call session-search.search \
   --params '{"query":"resume task","agentId":"main","sinceDays":2,"limit":8}' \
   --json
 ```
+
+From a chat channel that supports OpenClaw plugin commands, including Feishu/Lark:
+
+```text
+/session-search resume task
+```
+
+The command returns deterministic text directly from the plugin. It does not call a model.
 
 ## Configuration
 
@@ -67,4 +76,3 @@ Validated against a live OpenClaw gateway:
 - Default filtering of subagent, cron, tool, and internal sessions
 - Path traversal guard for transcript paths outside the agent session directory
 - `rg` search over 5800 sessions and about 24 MB of transcript data
-

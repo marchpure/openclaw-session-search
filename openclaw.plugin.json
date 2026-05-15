@@ -11,6 +11,9 @@
     ],
     "gatewayMethods": [
       "session-search.search"
+    ],
+    "commands": [
+      "session-search"
     ]
   },
   "uiHints": {
