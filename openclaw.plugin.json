@@ -1,0 +1,108 @@
+{
+  "id": "session-search",
+  "name": "Session Search",
+  "description": "Low-frequency search over OpenClaw session transcripts, independent from memory plugins.",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "session_search"
+    ],
+    "gatewayMethods": [
+      "session-search.search"
+    ]
+  },
+  "uiHints": {
+    "enabled": {
+      "label": "Enable Session Search",
+      "help": "Expose the session_search tool."
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "backend": {
+        "type": "string",
+        "enum": [
+          "rg",
+          "node"
+        ],
+        "default": "rg"
+      },
+      "fallbackToNode": {
+        "type": "boolean",
+        "default": true
+      },
+      "defaultLimit": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50,
+        "default": 8
+      },
+      "maxSessions": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "default": 200
+      },
+      "maxCharsPerMessage": {
+        "type": "integer",
+        "minimum": 80,
+        "maximum": 4000,
+        "default": 800
+      },
+      "maxTranscriptBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 2097152,
+        "default": 262144
+      },
+      "maxFiles": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10000,
+        "default": 1000
+      },
+      "sinceDays": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 3650,
+        "default": 2
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 100,
+        "maximum": 60000,
+        "default": 3000
+      },
+      "rgBatchSize": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500,
+        "default": 200
+      },
+      "includeAssistantByDefault": {
+        "type": "boolean",
+        "default": true
+      },
+      "includeCron": {
+        "type": "boolean",
+        "default": false
+      },
+      "includeSubagents": {
+        "type": "boolean",
+        "default": false
+      },
+      "includeInternal": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}
