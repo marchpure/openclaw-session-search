@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const DEFAULTS = {
@@ -192,6 +193,13 @@ function listSessionEntries(agentId, opts) {
   return { sessions, stats };
 }
 
+function parseAgentIdFromSessionKey(key) {
+  const parts = String(key ?? "").split(":");
+  const agentIndex = parts.indexOf("agent");
+  if (agentIndex >= 0 && parts[agentIndex + 1]) return parts[agentIndex + 1];
+  return "main";
+}
+
 function resolveSessionFile(dir, entry) {
   const raw = typeof entry.sessionFile === "string" ? entry.sessionFile.trim() : "";
   if (raw) return path.isAbsolute(raw) ? raw : path.resolve(dir, raw);
@@ -223,6 +231,72 @@ function parseTranscriptLine(line) {
   } catch {
     return null;
   }
+}
+
+function readLastMessagePreview(sessionFile, maxChars = 96) {
+  if (!sessionFile || !fs.existsSync(sessionFile)) return "";
+  try {
+    const stat = fs.statSync(sessionFile);
+    const readBytes = Math.min(stat.size, 64 * 1024);
+    const fd = fs.openSync(sessionFile, "r");
+    const buffer = Buffer.alloc(readBytes);
+    fs.readSync(fd, buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
+    fs.closeSync(fd);
+    const lines = buffer.toString("utf8").trim().split(/\r?\n/).reverse();
+    for (const line of lines) {
+      const msg = parseTranscriptLine(line);
+      if (!msg || !SEARCHABLE_ROLES.has(msg.role)) continue;
+      return `${roleLabel(msg.role)}：${singleLine(msg.text, maxChars)}`;
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function normalizeSessionLabel(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function parseSessionResumeLabel(raw) {
+  const label = normalizeSessionLabel(raw);
+  if (!label) return { ok: false, error: "请提供要恢复的命名会话。" };
+  if (label.length > 120) return { ok: false, error: "会话名过长，最多 120 个字符。" };
+  if (/[\r\n\t]/.test(label)) return { ok: false, error: "会话名不能包含换行或制表符。" };
+  return { ok: true, label };
+}
+
+function listNamedSessions(agentId, cfg, params = {}) {
+  const listed = listSessionEntries(agentId, {
+    maxSessions: clampInt(params.maxSessions, 100, 1, cfg.maxSessions),
+    sinceDays: clampInt(params.sinceDays, 3650, 0, 3650),
+    includeCron: false,
+    includeSubagents: false,
+    includeInternal: false,
+  });
+  const sessions = listed.sessions
+    .filter((session) => normalizeSessionLabel(session.label))
+    .map((session) => ({
+      ...session,
+      label: normalizeSessionLabel(session.label),
+      lastMessagePreview: readLastMessagePreview(session.sessionFile),
+    }));
+  return { sessions, stats: listed.stats };
+}
+
+function resolveNamedSession(agentId, label, cfg) {
+  const { sessions } = listNamedSessions(agentId, cfg, { maxSessions: cfg.maxSessions });
+  const exact = sessions.filter((session) => session.label === label);
+  if (exact.length === 1) return { ok: true, session: exact[0] };
+  if (exact.length > 1) {
+    return { ok: false, code: "ambiguous", matches: exact };
+  }
+  const insensitive = sessions.filter((session) => session.label.toLowerCase() === label.toLowerCase());
+  if (insensitive.length === 1) return { ok: true, session: insensitive[0] };
+  if (insensitive.length > 1) {
+    return { ok: false, code: "ambiguous", matches: insensitive };
+  }
+  return { ok: false, code: "not_found", matches: [] };
 }
 
 function tokenize(text) {
@@ -496,6 +570,226 @@ function roleLabel(role) {
   return role || "未知";
 }
 
+function stripKnownChannelPrefix(channel, value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  const prefix = `${String(channel ?? "").trim().toLowerCase()}:`;
+  return prefix && text.toLowerCase().startsWith(prefix) ? text.slice(prefix.length) : text;
+}
+
+function resolveCommandConversation(ctx) {
+  const channel = String(ctx.channel ?? ctx.channelId ?? "").trim().toLowerCase();
+  if (!channel) return null;
+  const accountId = String(ctx.accountId ?? "default").trim() || "default";
+  const rawConversation =
+    typeof ctx.to === "string" && ctx.to.trim()
+      ? ctx.to
+      : typeof ctx.from === "string" && ctx.from.trim()
+        ? ctx.from
+        : typeof ctx.senderId === "string" && ctx.senderId.trim()
+          ? `user:${ctx.senderId.trim()}`
+          : "";
+  const conversationId = stripKnownChannelPrefix(channel, rawConversation);
+  if (!conversationId) return null;
+  const parentConversationId =
+    typeof ctx.threadParentId === "string" && ctx.threadParentId.trim()
+      ? stripKnownChannelPrefix(channel, ctx.threadParentId)
+      : undefined;
+  return {
+    channel,
+    accountId,
+    conversationId:
+      typeof ctx.messageThreadId === "string" || typeof ctx.messageThreadId === "number"
+        ? String(ctx.messageThreadId)
+        : conversationId,
+    ...(parentConversationId ? { parentConversationId } : {}),
+  };
+}
+
+function resolveOpenClawDistDir() {
+  const candidates = [
+    process.env.OPENCLAW_DIST_DIR,
+    "/usr/lib/node_modules/openclaw/dist",
+    path.join(process.cwd(), "dist"),
+  ].filter(Boolean);
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function importOpenClawInternalChunk(prefix) {
+  const distDir = resolveOpenClawDistDir();
+  if (!distDir) return null;
+  const direct = path.join(distDir, `${prefix}.js`);
+  const file = fs.existsSync(direct)
+    ? direct
+    : fs.readdirSync(distDir).find((name) => name.startsWith(`${prefix}-`) && name.endsWith(".js"));
+  if (!file) return null;
+  const filePath = path.isAbsolute(file) ? file : path.join(distDir, file);
+  return import(pathToFileURL(filePath).href);
+}
+
+async function getCoreSessionBindingService() {
+  const mod = await importOpenClawInternalChunk("session-binding-service");
+  const getter = mod?.getSessionBindingService ?? mod?.r;
+  return typeof getter === "function" ? getter() : null;
+}
+
+function formatNamedSessionsReply(sessions, stats) {
+  if (!sessions.length) {
+    return "可恢复的命名会话：0 个\n\n没有找到用户可见的命名会话。";
+  }
+  const lines = [
+    `可恢复的命名会话：${sessions.length} 个`,
+    `范围：可见会话 ${stats.visibleSessions} 个`,
+    "",
+  ];
+  sessions.slice(0, 20).forEach((session, index) => {
+    lines.push(`--- ${index + 1}/${Math.min(sessions.length, 20)} ---`);
+    lines.push(`会话：${singleLine(session.label, 80)}`);
+    const when = formatTime(session.updatedAt);
+    if (when) lines.push(`时间：${when}`);
+    if (session.lastMessagePreview) lines.push(`最近：${singleLine(session.lastMessagePreview, 120)}`);
+    lines.push("");
+  });
+  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话名。`);
+  lines.push("使用：/resume <会话名>");
+  return lines.join("\n");
+}
+
+function formatResumeSuccessReply(session, binding) {
+  return [
+    `已恢复会话：${session.label}`,
+    "",
+    `目标：${session.key}`,
+    binding?.bindingId ? `绑定：${binding.bindingId}` : "",
+    "后续消息会继续进入这个命名会话。",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function sessionResume(params, cfg) {
+  const agentId = normalizeAgentId(params.agentId);
+  const labelRaw = typeof params.label === "string" ? params.label : "";
+  if (!labelRaw.trim()) {
+    return {
+      action: "list",
+      ...listNamedSessions(agentId, cfg, { maxSessions: cfg.maxSessions }),
+    };
+  }
+  const parsed = parseSessionResumeLabel(labelRaw);
+  if (!parsed.ok) {
+    return { action: "error", code: "invalid_label", message: parsed.error };
+  }
+  const resolved = resolveNamedSession(agentId, parsed.label, cfg);
+  if (!resolved.ok) {
+    return {
+      action: "error",
+      code: resolved.code,
+      message:
+        resolved.code === "ambiguous"
+          ? `命名会话不唯一：${parsed.label}`
+          : `找不到命名会话：${parsed.label}`,
+      matches: resolved.matches?.map((session) => ({
+        key: session.key,
+        label: session.label,
+        updatedAt: session.updatedAt,
+      })),
+    };
+  }
+  const conversation = params.conversation ?? null;
+  if (!conversation?.channel || !conversation?.conversationId) {
+    return {
+      action: "error",
+      code: "conversation_unavailable",
+      message: "/resume 必须在可绑定的会话里执行。",
+    };
+  }
+  const service = await getCoreSessionBindingService();
+  if (!service?.bind || !service?.getCapabilities) {
+    return {
+      action: "error",
+      code: "binding_service_unavailable",
+      message: "当前 OpenClaw 运行时没有暴露会话绑定服务。",
+    };
+  }
+  const capabilities = service.getCapabilities({
+    channel: conversation.channel,
+    accountId: conversation.accountId ?? "default",
+  });
+  if (
+    !capabilities?.adapterAvailable ||
+    !capabilities.bindSupported ||
+    !capabilities.placements?.includes("current")
+  ) {
+    return {
+      action: "error",
+      code: "binding_unavailable",
+      message: `当前通道不支持会话绑定：${conversation.channel}:${conversation.accountId ?? "default"}`,
+      capabilities,
+    };
+  }
+  const senderId = typeof params.senderId === "string" ? params.senderId.trim() : "";
+  const existing = service.resolveByConversation?.(conversation);
+  const boundBy = typeof existing?.metadata?.boundBy === "string" ? existing.metadata.boundBy.trim() : "";
+  if (existing && boundBy && boundBy !== "system" && senderId && senderId !== boundBy) {
+    return {
+      action: "error",
+      code: "owned_by_other_sender",
+      message: `当前会话只能由 ${boundBy} 恢复。`,
+    };
+  }
+  try {
+    const targetAgentId = parseAgentIdFromSessionKey(resolved.session.key);
+    const binding = await service.bind({
+      targetSessionKey: resolved.session.key,
+      targetKind: "session",
+      conversation,
+      placement: "current",
+      metadata: {
+        threadName: `OpenClaw ${targetAgentId}/${resolved.session.label}`,
+        introText: `Resumed named session ${resolved.session.label}.`,
+        agentId: targetAgentId,
+        label: resolved.session.label,
+        boundBy: senderId || "unknown",
+      },
+    });
+    return {
+      action: "resume",
+      session: resolved.session,
+      binding,
+    };
+  } catch (error) {
+    return {
+      action: "error",
+      code: "bind_failed",
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function formatSessionResumeCommandReply(result) {
+  if (result.action === "list") {
+    return formatNamedSessionsReply(result.sessions, result.stats);
+  }
+  if (result.action === "resume") {
+    return formatResumeSuccessReply(result.session, result.binding);
+  }
+  const lines = [`恢复会话失败：${result.message || result.code || "unknown"}`];
+  if (Array.isArray(result.matches) && result.matches.length > 0) {
+    lines.push("", "候选会话：");
+    result.matches.slice(0, 10).forEach((session, index) => {
+      lines.push(`${index + 1}. ${session.label || session.key}`);
+    });
+  }
+  return lines.join("\n");
+}
+
 function cleanDisplaySnippet(value, query) {
   let text = String(value ?? "")
     .replace(/```(?:json)?/gi, " ")
@@ -653,6 +947,29 @@ export default definePluginEntry({
       { scope: "operator.read" },
     );
 
+    api.registerGatewayMethod(
+      "session-search.resume",
+      async ({ params, respond }) => {
+        const cfg = resolveConfig(api.pluginConfig);
+        if (!cfg.enabled) {
+          respond(false, undefined, {
+            code: "disabled",
+            message: "session-search plugin is disabled",
+          });
+          return;
+        }
+        try {
+          respond(true, await sessionResume(asRecord(params), cfg));
+        } catch (error) {
+          respond(false, undefined, {
+            code: "session_resume_failed",
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      { scope: "operator.write" },
+    );
+
     api.registerTool(
       () => {
         const cfg = resolveConfig(api.pluginConfig);
@@ -712,6 +1029,29 @@ export default definePluginEntry({
       },
       { name: "session_search" },
     );
+
+    api.registerCommand({
+      name: "resume",
+      description: "List or resume named OpenClaw sessions",
+      acceptsArgs: true,
+      requireAuth: true,
+      async handler(ctx) {
+        const cfg = resolveConfig(api.pluginConfig);
+        if (!cfg.enabled) {
+          return { text: "Session resume is disabled." };
+        }
+        const result = await sessionResume(
+          {
+            label: typeof ctx.args === "string" ? ctx.args.trim() : "",
+            agentId: "main",
+            conversation: resolveCommandConversation(ctx),
+            senderId: ctx.senderId,
+          },
+          cfg,
+        );
+        return { text: formatSessionResumeCommandReply(result) };
+      },
+    });
 
     api.registerCommand({
       name: "session-search",

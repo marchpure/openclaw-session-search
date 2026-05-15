@@ -10,9 +10,11 @@
       "session_search"
     ],
     "gatewayMethods": [
-      "session-search.search"
+      "session-search.search",
+      "session-search.resume"
     ],
     "commands": [
+      "resume",
       "session-search"
     ]
   },

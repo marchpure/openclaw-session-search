@@ -7,6 +7,7 @@ The plugin exposes:
 - Gateway RPC: `session-search.search`
 - Tool: `session_search`
 - Slash command: `/session-search <keyword>`
+- Slash command: `/resume [session-label]`
 
 It searches recent user-visible session transcripts with `rg` when available, with a deterministic Node.js fallback. It does not call a model and does not depend on the configured memory slot.
 
@@ -43,6 +44,17 @@ From a chat channel that supports OpenClaw plugin commands, including Feishu/Lar
 ```
 
 The command returns deterministic text directly from the plugin. It does not call a model.
+
+## Named Session Resume
+
+The plugin also implements the named-session resume behavior from OpenClaw PR 82112 as a plugin command:
+
+```text
+/resume
+/resume resume-test-alpha
+```
+
+`/resume` lists user-visible named sessions. `/resume <session-label>` resolves an exact session label and binds the current conversation to that session through OpenClaw's session binding service. This command is deterministic and does not call a model.
 
 ## Configuration
 
