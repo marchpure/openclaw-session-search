@@ -356,6 +356,8 @@ function scoreText(text, terms) {
 }
 
 function snippet(text, terms, maxChars) {
+  const cleaned = cleanTranscriptText(text);
+  text = cleaned || text;
   const lower = text.toLowerCase();
   const firstHit = terms
     .map((term) => lower.indexOf(term))
@@ -365,6 +367,32 @@ function snippet(text, terms, maxChars) {
   const start = Math.max(0, firstHit - Math.floor(maxChars / 3));
   const end = Math.min(text.length, start + maxChars);
   return `${start > 0 ? "..." : ""}${text.slice(start, end)}${end < text.length ? "..." : ""}`;
+}
+
+function cleanTranscriptText(value) {
+  let text = String(value ?? "");
+  const metadataMarkers = [
+    "\n\n你好",
+    "\n\n/resume",
+    "\n\n/session-search",
+    "\n\n/status",
+  ];
+  if (/Conversation info \(untrusted metadata\):|Sender \(untrusted metadata\):/.test(text)) {
+    const hit = metadataMarkers
+      .map((marker) => text.lastIndexOf(marker))
+      .filter((index) => index >= 0)
+      .sort((a, b) => b - a)[0];
+    if (hit !== undefined) {
+      text = text.slice(hit + 2);
+    }
+  }
+  return text
+    .replace(/^System: \[[^\n]+\][\s\S]*?\n\n(?=\S)/, "")
+    .replace(/Conversation info \(untrusted metadata\):[\s\S]*?```\s*/g, "")
+    .replace(/Sender \(untrusted metadata\):[\s\S]*?```\s*/g, "")
+    .replace(/```(?:json)?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function searchableSessions(sessions, opts) {
@@ -845,11 +873,7 @@ function formatSessionResumeCommandReply(result) {
 }
 
 function cleanDisplaySnippet(value, query) {
-  let text = String(value ?? "")
-    .replace(/```(?:json)?/gi, " ")
-    .replace(/Sender \(untrusted metadata\):/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  let text = cleanTranscriptText(value);
   const queryText = String(query ?? "").trim();
   if (queryText) {
     const hit = text.toLowerCase().lastIndexOf(queryText.toLowerCase());

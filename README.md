@@ -103,3 +103,11 @@ node scripts/validate-e2e.mjs
 ```
 
 The matrix creates a temporary OpenClaw state directory, registers the plugin through a stubbed plugin SDK, and calls the plugin's Gateway methods and slash command handlers. It currently runs exactly 300 checks across functionality, usability, display consistency, filtering, reliability, large-data behavior, and performance.
+
+Run the live OpenClaw validation matrix:
+
+```bash
+node scripts/validate-live-openclaw.mjs
+```
+
+The live matrix calls the running `openclaw gateway call` binary only, using the current real OpenClaw state and real session transcripts. It runs 3000 assertions over the data returned by live `/resume` and `/session-search` plugin Gateway methods, including real resume bindings against the current Feishu conversation. The script snapshots and restores `~/.openclaw/bindings/current-conversations.json` after the run.
