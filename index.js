@@ -496,15 +496,29 @@ function roleLabel(role) {
   return role || "未知";
 }
 
+function cleanDisplaySnippet(value, query) {
+  let text = String(value ?? "")
+    .replace(/```(?:json)?/gi, " ")
+    .replace(/Sender \(untrusted metadata\):/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const queryText = String(query ?? "").trim();
+  if (queryText) {
+    const hit = text.toLowerCase().lastIndexOf(queryText.toLowerCase());
+    if (hit > 0 && /[{}":]/.test(text.slice(0, hit))) {
+      text = text.slice(hit).trim();
+    }
+  }
+  return singleLine(text, 96);
+}
+
 function formatSessionSearchCommandReply(result) {
   const filtered =
     result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal;
   const lines = [
     `历史会话搜索：${result.query}`,
     "",
-    `结果：${result.count} 条`,
-    `范围：搜索 ${result.searchedFiles} 个可见会话，过滤 ${filtered} 个内部会话`,
-    `耗时：${result.tookMs}ms (${result.backend})`,
+    `结果 ${result.count} 条 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
   ];
   if (!Array.isArray(result.results) || result.results.length === 0) {
     lines.push("", "未找到匹配的用户可见会话。");
@@ -514,11 +528,12 @@ function formatSessionSearchCommandReply(result) {
   result.results.forEach((item, index) => {
     const when = formatTime(item.updatedAt);
     const label = item.label || item.key || item.sessionId || "session";
-    lines.push(`${index + 1}. ${singleLine(label, 60)}`);
-    if (when) lines.push(`   时间：${when}`);
-    lines.push(`   角色：${roleLabel(item.role)}`);
-    lines.push(`   片段：${singleLine(item.snippet, 120)}`);
-    if (index < result.results.length - 1) lines.push("");
+    lines.push(`--- ${index + 1}/${result.results.length} ---`);
+    lines.push(`会话：${singleLine(label, 56)}`);
+    if (when) lines.push(`时间：${when}`);
+    lines.push(`角色：${roleLabel(item.role)}`);
+    lines.push(`片段：${cleanDisplaySnippet(item.snippet, result.query)}`);
+    lines.push("");
   });
   return lines.join("\n");
 }
