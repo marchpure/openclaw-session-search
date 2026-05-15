@@ -54,7 +54,7 @@ The plugin also implements the named-session resume behavior from OpenClaw PR 82
 /resume resume-test-alpha
 ```
 
-`/resume` lists user-visible named sessions. `/resume <session-label>` resolves an exact session label and binds the current conversation to that session through OpenClaw's session binding service. This command is deterministic and does not call a model.
+`/resume` lists user-visible resumable sessions. `/resume <session-label-or-key>` resolves an exact session label first, then an exact session key, and binds the current conversation to that session through OpenClaw's session binding service. This command is deterministic and does not call a model.
 
 ## Configuration
 

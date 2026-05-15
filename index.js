@@ -266,7 +266,11 @@ function parseSessionResumeLabel(raw) {
   return { ok: true, label };
 }
 
-function listNamedSessions(agentId, cfg, params = {}) {
+function sessionDisplayName(session) {
+  return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
+}
+
+function listResumableSessions(agentId, cfg, params = {}) {
   const listed = listSessionEntries(agentId, {
     maxSessions: clampInt(params.maxSessions, 100, 1, cfg.maxSessions),
     sinceDays: clampInt(params.sinceDays, 3650, 0, 3650),
@@ -274,24 +278,26 @@ function listNamedSessions(agentId, cfg, params = {}) {
     includeSubagents: false,
     includeInternal: false,
   });
-  const sessions = listed.sessions
-    .filter((session) => normalizeSessionLabel(session.label))
-    .map((session) => ({
-      ...session,
-      label: normalizeSessionLabel(session.label),
-      lastMessagePreview: readLastMessagePreview(session.sessionFile),
-    }));
+  const sessions = listed.sessions.map((session) => ({
+    ...session,
+    label: normalizeSessionLabel(session.label),
+    displayName: sessionDisplayName(session),
+    lastMessagePreview: readLastMessagePreview(session.sessionFile),
+  }));
   return { sessions, stats: listed.stats };
 }
 
-function resolveNamedSession(agentId, label, cfg) {
-  const { sessions } = listNamedSessions(agentId, cfg, { maxSessions: cfg.maxSessions });
-  const exact = sessions.filter((session) => session.label === label);
+function resolveResumableSession(agentId, target, cfg) {
+  const { sessions } = listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions });
+  const exact = sessions.filter((session) => session.label === target || session.key === target);
   if (exact.length === 1) return { ok: true, session: exact[0] };
   if (exact.length > 1) {
     return { ok: false, code: "ambiguous", matches: exact };
   }
-  const insensitive = sessions.filter((session) => session.label.toLowerCase() === label.toLowerCase());
+  const targetLower = target.toLowerCase();
+  const insensitive = sessions.filter(
+    (session) => session.label.toLowerCase() === targetLower || session.key.toLowerCase() === targetLower,
+  );
   if (insensitive.length === 1) return { ok: true, session: insensitive[0] };
   if (insensitive.length > 1) {
     return { ok: false, code: "ambiguous", matches: insensitive };
@@ -641,33 +647,34 @@ async function getCoreSessionBindingService() {
 
 function formatNamedSessionsReply(sessions, stats) {
   if (!sessions.length) {
-    return "可恢复的命名会话：0 个\n\n没有找到用户可见的命名会话。";
+    return "可恢复会话：0 个\n\n没有找到用户可见会话。";
   }
   const lines = [
-    `可恢复的命名会话：${sessions.length} 个`,
+    `可恢复会话：${sessions.length} 个`,
     `范围：可见会话 ${stats.visibleSessions} 个`,
     "",
   ];
   sessions.slice(0, 20).forEach((session, index) => {
     lines.push(`--- ${index + 1}/${Math.min(sessions.length, 20)} ---`);
-    lines.push(`会话：${singleLine(session.label, 80)}`);
+    lines.push(`会话：${singleLine(session.displayName || sessionDisplayName(session), 80)}`);
+    if (!session.label && session.key) lines.push(`类型：未命名会话，可用 key 恢复`);
     const when = formatTime(session.updatedAt);
     if (when) lines.push(`时间：${when}`);
     if (session.lastMessagePreview) lines.push(`最近：${singleLine(session.lastMessagePreview, 120)}`);
     lines.push("");
   });
-  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话名。`);
-  lines.push("使用：/resume <会话名>");
+  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话名或 key。`);
+  lines.push("使用：/resume <会话名或 session key>");
   return lines.join("\n");
 }
 
 function formatResumeSuccessReply(session, binding) {
   return [
-    `已恢复会话：${session.label}`,
+    `已恢复会话：${session.displayName || sessionDisplayName(session)}`,
     "",
     `目标：${session.key}`,
     binding?.bindingId ? `绑定：${binding.bindingId}` : "",
-    "后续消息会继续进入这个命名会话。",
+    "后续消息会继续进入这个会话。",
   ]
     .filter(Boolean)
     .join("\n");
@@ -679,25 +686,26 @@ async function sessionResume(params, cfg) {
   if (!labelRaw.trim()) {
     return {
       action: "list",
-      ...listNamedSessions(agentId, cfg, { maxSessions: cfg.maxSessions }),
+      ...listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions }),
     };
   }
   const parsed = parseSessionResumeLabel(labelRaw);
   if (!parsed.ok) {
     return { action: "error", code: "invalid_label", message: parsed.error };
   }
-  const resolved = resolveNamedSession(agentId, parsed.label, cfg);
+  const resolved = resolveResumableSession(agentId, parsed.label, cfg);
   if (!resolved.ok) {
     return {
       action: "error",
       code: resolved.code,
       message:
         resolved.code === "ambiguous"
-          ? `命名会话不唯一：${parsed.label}`
-          : `找不到命名会话：${parsed.label}`,
+          ? `可恢复会话不唯一：${parsed.label}`
+          : `找不到可恢复会话：${parsed.label}`,
       matches: resolved.matches?.map((session) => ({
         key: session.key,
         label: session.label,
+        displayName: session.displayName,
         updatedAt: session.updatedAt,
       })),
     };
@@ -746,16 +754,17 @@ async function sessionResume(params, cfg) {
   }
   try {
     const targetAgentId = parseAgentIdFromSessionKey(resolved.session.key);
+    const displayName = resolved.session.displayName || sessionDisplayName(resolved.session);
     const binding = await service.bind({
       targetSessionKey: resolved.session.key,
       targetKind: "session",
       conversation,
       placement: "current",
       metadata: {
-        threadName: `OpenClaw ${targetAgentId}/${resolved.session.label}`,
-        introText: `Resumed named session ${resolved.session.label}.`,
+        threadName: `OpenClaw ${targetAgentId}/${displayName}`,
+        introText: `Resumed session ${displayName}.`,
         agentId: targetAgentId,
-        label: resolved.session.label,
+        label: displayName,
         boundBy: senderId || "unknown",
       },
     });
@@ -784,7 +793,7 @@ function formatSessionResumeCommandReply(result) {
   if (Array.isArray(result.matches) && result.matches.length > 0) {
     lines.push("", "候选会话：");
     result.matches.slice(0, 10).forEach((session, index) => {
-      lines.push(`${index + 1}. ${session.label || session.key}`);
+      lines.push(`${index + 1}. ${session.displayName || session.label || session.key}`);
     });
   }
   return lines.join("\n");
