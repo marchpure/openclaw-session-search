@@ -95,3 +95,11 @@ Validated against a live OpenClaw gateway:
 - Default filtering of subagent, cron, tool, and internal sessions
 - Path traversal guard for transcript paths outside the agent session directory
 - `rg` search over 5800 sessions and about 24 MB of transcript data
+
+Run the local end-to-end validation matrix:
+
+```bash
+node scripts/validate-e2e.mjs
+```
+
+The matrix creates a temporary OpenClaw state directory, registers the plugin through a stubbed plugin SDK, and calls the plugin's Gateway methods and slash command handlers. It currently runs exactly 300 checks across functionality, usability, display consistency, filtering, reliability, large-data behavior, and performance.

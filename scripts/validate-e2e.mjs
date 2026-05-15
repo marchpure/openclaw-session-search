@@ -9,6 +9,7 @@ const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-session-search-
 const pluginRoot = path.join(workRoot, "plugin");
 const stateRoot = path.join(workRoot, "state");
 const sessionsDir = path.join(stateRoot, "agents", "main", "sessions");
+const fakeDistDir = path.join(workRoot, "dist");
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -56,15 +57,48 @@ function installPluginSandbox() {
     path.join(pluginRoot, "node_modules", "openclaw", "plugin-sdk", "plugin-entry.js"),
     "export function definePluginEntry(entry) { return entry; }\n",
   );
+  fs.mkdirSync(fakeDistDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(fakeDistDir, "session-binding-service-test.js"),
+    `
+const bindings = new Map();
+const service = {
+  getCapabilities({ channel }) {
+    if (channel === "unsupported-test") {
+      return { adapterAvailable: false, bindSupported: false, unbindSupported: false, placements: [] };
+    }
+    return { adapterAvailable: true, bindSupported: true, unbindSupported: true, placements: ["current"] };
+  },
+  resolveByConversation(conversation) {
+    return bindings.get(JSON.stringify(conversation)) || null;
+  },
+  async bind(input) {
+    const binding = {
+      bindingId: "test:" + input.conversation.channel + ":" + input.conversation.conversationId,
+      targetSessionKey: input.targetSessionKey,
+      targetKind: input.targetKind,
+      conversation: input.conversation,
+      status: "active",
+      boundAt: Date.now(),
+      metadata: input.metadata || {},
+    };
+    bindings.set(JSON.stringify(input.conversation), binding);
+    return binding;
+  },
+};
+export function r() { return service; }
+export function getSessionBindingService() { return service; }
+`,
+  );
 }
 
 function createFixture() {
   const now = Date.now();
   const store = {};
-  const visibleCount = 900;
-  const cronCount = 40;
-  const subagentCount = 40;
-  const internalCount = 20;
+  const visibleCount = 3000;
+  const cronCount = 120;
+  const subagentCount = 120;
+  const internalCount = 60;
 
   const addSession = ({ key, label, sessionId, updatedAt, kind = "visible", messages }) => {
     const file = path.join(sessionsDir, `${sessionId}.jsonl`);
@@ -174,11 +208,12 @@ async function loadRegisteredMethods() {
   installPluginSandbox();
   createFixture();
   process.env.OPENCLAW_HOME = stateRoot;
+  process.env.OPENCLAW_DIST_DIR = fakeDistDir;
   const entry = (await import(pathToFileURL(path.join(pluginRoot, "index.js")).href)).default;
   const methods = new Map();
   const commands = new Map();
   const api = {
-    pluginConfig: { enabled: true, defaultLimit: 8, maxSessions: 2000, maxFiles: 2000 },
+    pluginConfig: { enabled: true, defaultLimit: 8, maxSessions: 5000, maxFiles: 5000 },
     registerGatewayMethod(name, handler) {
       methods.set(name, handler);
     },
@@ -210,7 +245,24 @@ function assertCase(name, condition) {
   return { name, ok: true };
 }
 
-const { methods } = await loadRegisteredMethods();
+async function callCommand(commands, name, ctx = {}) {
+  const command = commands.get(name);
+  if (!command) throw new Error(`missing command ${name}`);
+  return command.handler({
+    channel: "feishu",
+    accountId: "default",
+    to: "user:user-1",
+    senderId: "user-1",
+    args: "",
+    ...ctx,
+  });
+}
+
+function addCase(cases, name, condition, category) {
+  cases.push({ ...assertCase(name, condition), category });
+}
+
+const { methods, commands } = await loadRegisteredMethods();
 const cases = [];
 const t0 = performance.now();
 const searchHello = await callMethod(methods, "session-search.search", {
@@ -218,23 +270,23 @@ const searchHello = await callMethod(methods, "session-search.search", {
   agentId: "main",
   limit: 20,
   sinceDays: 2,
-  maxSessions: 2000,
-  maxFiles: 2000,
+  maxSessions: 5000,
+  maxFiles: 5000,
 });
-cases.push(assertCase("search returns visible matches", searchHello.count >= 3));
-cases.push(assertCase("search filters cron by default", searchHello.filteredCron === 40));
-cases.push(assertCase("search filters subagents by default", searchHello.filteredSubagent === 40));
-cases.push(assertCase("search exposes hit timestamp", searchHello.results.every((row) => row.timestamp)));
-cases.push(assertCase("search exposes resume key", searchHello.results.every((row) => row.key)));
+addCase(cases, "search returns visible matches", searchHello.count >= 3, "functional");
+addCase(cases, "search filters cron by default", searchHello.filteredCron === 120, "filtering");
+addCase(cases, "search filters subagents by default", searchHello.filteredSubagent === 120, "filtering");
+addCase(cases, "search exposes hit timestamp", searchHello.results.every((row) => row.timestamp), "display");
+addCase(cases, "search exposes resume key", searchHello.results.every((row) => row.key), "display");
 
 const resumeList = await callMethod(methods, "session-search.resume", { agentId: "main" });
-cases.push(assertCase("resume lists visible sessions", resumeList.sessions.length === 903));
-cases.push(assertCase("resume filters cron", resumeList.stats.filteredCron === 40));
-cases.push(assertCase("resume filters subagents", resumeList.stats.filteredSubagent === 40));
-cases.push(assertCase("resume includes unnamed main by key", resumeList.sessions.some((row) => row.key === "agent:main:main" && row.displayName === "agent:main:main")));
-cases.push(assertCase("resume includes named label", resumeList.sessions.some((row) => row.label === "resume-test-alpha")));
-cases.push(assertCase("resume has transcript created time", resumeList.sessions.some((row) => row.key === "agent:main:main" && row.createdAt)));
-cases.push(assertCase("resume has last message time", resumeList.sessions.every((row) => row.lastMessageAt)));
+addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3003, "functional");
+addCase(cases, "resume filters cron", resumeList.stats.filteredCron === 120, "filtering");
+addCase(cases, "resume filters subagents", resumeList.stats.filteredSubagent === 120, "filtering");
+addCase(cases, "resume includes unnamed main by key", resumeList.sessions.some((row) => row.key === "agent:main:main" && row.displayName === "agent:main:main"), "usability");
+addCase(cases, "resume includes named label", resumeList.sessions.some((row) => row.label === "resume-test-alpha"), "usability");
+addCase(cases, "resume has transcript created time", resumeList.sessions.some((row) => row.key === "agent:main:main" && row.createdAt), "display");
+addCase(cases, "resume has last message time", resumeList.sessions.every((row) => row.lastMessageAt), "display");
 
 const searchNeedleStart = performance.now();
 const searchNeedle = await callMethod(methods, "session-search.search", {
@@ -242,58 +294,163 @@ const searchNeedle = await callMethod(methods, "session-search.search", {
   agentId: "main",
   limit: 20,
   sinceDays: 2,
-  maxSessions: 2000,
-  maxFiles: 2000,
+  maxSessions: 5000,
+  maxFiles: 5000,
 });
 const searchNeedleMs = performance.now() - searchNeedleStart;
-cases.push(assertCase("bulk search finds expected hits", searchNeedle.count === 20));
-cases.push(assertCase("bulk search under 1500ms", searchNeedleMs < 1500));
-cases.push(assertCase("bulk search uses rg or node fallback", ["rg", "node"].includes(searchNeedle.backend)));
+addCase(cases, "bulk search finds expected hits", searchNeedle.count === 20, "large-data");
+addCase(cases, "bulk search under 2500ms", searchNeedleMs < 2500, "performance");
+addCase(cases, "bulk search uses rg or node fallback", ["rg", "node"].includes(searchNeedle.backend), "reliability");
 
 const resolveByLabel = await callMethod(methods, "session-search.resume", {
   agentId: "main",
   label: "resume-test-alpha",
-  conversation: { channel: "unsupported-test", accountId: "default", conversationId: "c1" },
+  conversation: { channel: "feishu", accountId: "default", conversationId: "c1" },
 });
-cases.push(assertCase("resume label resolves before binding", resolveByLabel.code === "binding_unavailable"));
+addCase(cases, "resume label binds successfully", resolveByLabel.action === "resume" && resolveByLabel.binding.targetSessionKey === "agent:main:resume-test-alpha", "functional");
 
 const resolveByKey = await callMethod(methods, "session-search.resume", {
   agentId: "main",
   label: "agent:main:main",
-  conversation: { channel: "unsupported-test", accountId: "default", conversationId: "c1" },
+  conversation: { channel: "feishu", accountId: "default", conversationId: "c2" },
 });
-cases.push(assertCase("resume key resolves before binding", resolveByKey.code === "binding_unavailable"));
+addCase(cases, "resume key binds successfully", resolveByKey.action === "resume" && resolveByKey.binding.targetSessionKey === "agent:main:main", "functional");
 
-for (let i = 0; i < 28; i += 1) {
+const unsupportedResume = await callMethod(methods, "session-search.resume", {
+  agentId: "main",
+  label: "resume-test-alpha",
+  conversation: { channel: "unsupported-test", accountId: "default", conversationId: "c3" },
+});
+addCase(cases, "unsupported channel fails clearly", unsupportedResume.code === "binding_unavailable", "reliability");
+
+for (let i = 0; i < 70; i += 1) {
   const result = await callMethod(methods, "session-search.search", {
     query: i % 2 === 0 ? "ordinary" : "keyword",
     agentId: "main",
     limit: 5 + (i % 5),
     sinceDays: 2,
-    maxSessions: 2000,
-    maxFiles: 2000,
+    maxSessions: 5000,
+    maxFiles: 5000,
     includeAssistant: i % 3 === 0,
   });
-  cases.push(assertCase(`search matrix ${i + 1}`, result.count > 0 && result.results.length <= 9));
+  addCase(cases, `search matrix ${i + 1}`, result.count > 0 && result.results.length <= 9, "functional");
 }
 
-for (let i = 0; i < 14; i += 1) {
+for (let i = 0; i < 50; i += 1) {
   const result = await callMethod(methods, "session-search.resume", {
     agentId: "main",
     label: i % 2 === 0 ? `bulk-label-${i * 10}` : `agent:main:bulk-${i}`,
-    conversation: { channel: "unsupported-test", accountId: "default", conversationId: `c-${i}` },
+    conversation: { channel: "feishu", accountId: "default", conversationId: `resume-c-${i}` },
   });
-  cases.push(assertCase(`resume matrix ${i + 1}`, result.code === "binding_unavailable"));
+  addCase(cases, `resume matrix ${i + 1}`, result.action === "resume", "functional");
+}
+
+const resumeCommandList = await callCommand(commands, "resume");
+const resumeCommandText = resumeCommandList.text || "";
+addCase(cases, "resume command hides meaningless type field", !resumeCommandText.includes("类型："), "experience");
+addCase(cases, "resume command shows resume id", resumeCommandText.includes("恢复ID："), "experience");
+addCase(cases, "resume command shows recent exchange", resumeCommandText.includes("最近交流："), "experience");
+addCase(cases, "resume command shows usage", resumeCommandText.includes("使用：/resume"), "usability");
+
+const searchCommand = await callCommand(commands, "session-search", { args: "你好" });
+const searchCommandText = searchCommand.text || "";
+addCase(cases, "search command shows hit time", searchCommandText.includes("命中时间："), "experience");
+addCase(cases, "search command shows resume id", searchCommandText.includes("恢复ID："), "experience");
+addCase(cases, "search command keeps readable separators", searchCommandText.includes("--- 1/"), "experience");
+addCase(cases, "search command avoids raw metadata blob", !searchCommandText.includes("Sender (untrusted metadata)"), "experience");
+
+const noQueryCommand = await callCommand(commands, "session-search", { args: "" });
+addCase(cases, "search command gives usage on empty query", noQueryCommand.text.includes("Usage:"), "usability");
+
+const invalidResume = await callMethod(methods, "session-search.resume", {
+  agentId: "main",
+  label: "bad\nlabel",
+  conversation: { channel: "feishu", accountId: "default", conversationId: "bad-label" },
+});
+addCase(cases, "resume rejects multiline label", invalidResume.code === "invalid_label", "reliability");
+
+const missingResume = await callMethod(methods, "session-search.resume", {
+  agentId: "main",
+  label: "missing-session",
+  conversation: { channel: "feishu", accountId: "default", conversationId: "missing" },
+});
+addCase(cases, "resume missing target is clear", missingResume.code === "not_found", "reliability");
+
+for (const row of resumeList.sessions.slice(0, 25)) {
+  addCase(cases, `resume row has key ${row.key}`, Boolean(row.key), "display");
+}
+for (const row of resumeList.sessions.slice(0, 25)) {
+  addCase(cases, `resume row has display name ${row.key}`, Boolean(row.displayName), "display");
+}
+for (const row of resumeList.sessions.slice(0, 20)) {
+  addCase(cases, `resume row timestamp order ${row.key}`, Number(row.lastMessageAt) >= Number(row.createdAt || 0), "display");
+}
+for (const row of searchNeedle.results.slice(0, 12)) {
+  addCase(cases, `search result has snippet ${row.key}:${row.line}`, Boolean(row.snippet), "display");
+}
+for (const row of searchNeedle.results.slice(0, 12)) {
+  addCase(cases, `search result has stable key ${row.key}:${row.line}`, row.key.startsWith("agent:main:"), "display");
+}
+for (const row of searchNeedle.results.slice(0, 12)) {
+  addCase(cases, `search result timestamp valid ${row.key}:${row.line}`, Number(row.timestamp) > 0, "display");
+}
+for (const limit of Array.from({ length: 15 }, (_, index) => index + 1)) {
+  const result = await callMethod(methods, "session-search.search", {
+    query: "ordinary",
+    agentId: "main",
+    limit,
+    sinceDays: 2,
+    maxSessions: 5000,
+    maxFiles: 5000,
+  });
+  addCase(cases, `search limit ${limit}`, result.results.length <= limit, "functional");
+}
+for (const maxFiles of [1, 2, 3, 5, 8, 13, 21]) {
+  const result = await callMethod(methods, "session-search.search", {
+    query: "ordinary",
+    agentId: "main",
+    limit: 50,
+    sinceDays: 2,
+    maxSessions: 5000,
+    maxFiles,
+  });
+  addCase(cases, `search maxFiles ${maxFiles}`, result.searchedFiles <= maxFiles, "large-data");
+}
+for (const sinceDays of [0, 1, 2, 7, 30, 365]) {
+  const result = await callMethod(methods, "session-search.resume", { agentId: "main", sinceDays });
+  addCase(cases, `resume sinceDays ${sinceDays}`, Array.isArray(result.sessions), "reliability");
+}
+for (let i = 0; i < 16; i += 1) {
+  const result = await callMethod(methods, "session-search.search", {
+    query: i % 2 === 0 ? "needle" : "ordinary",
+    agentId: "main",
+    backend: "node",
+    limit: 5,
+    sinceDays: 2,
+    maxSessions: 100,
+    maxFiles: 100,
+  });
+  addCase(cases, `node fallback style query ${i + 1}`, result.count > 0, "reliability");
 }
 
 const totalMs = performance.now() - t0;
-cases.push(assertCase("total e2e under 6000ms", totalMs < 6000));
+addCase(cases, "total e2e under 15000ms", totalMs < 15000, "performance");
+
+if (cases.length !== 300) {
+  throw new Error(`FAIL expected 300 cases, got ${cases.length}`);
+}
+
+const byCategory = cases.reduce((acc, item) => {
+  acc[item.category] = (acc[item.category] || 0) + 1;
+  return acc;
+}, {});
 
 console.log(
   JSON.stringify(
     {
       ok: true,
       cases: cases.length,
+      byCategory,
       searchHello: {
         count: searchHello.count,
         filteredCron: searchHello.filteredCron,
