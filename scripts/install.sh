@@ -172,7 +172,12 @@ verify_install() {
     exit 1
   }
 
-  if openclaw gateway call session-search.search \
+  if [ "$SKIP_GATEWAY_RESTART" = "1" ]; then
+    log "gateway probe skipped because gateway restart was skipped"
+    return
+  fi
+
+  if timeout 20s openclaw gateway call session-search.search \
       --params '{"query":"__openclaw_session_search_install_probe__","agentId":"main","limit":1,"sinceDays":2}' \
       --json >/tmp/openclaw-session-search-probe.json 2>/tmp/openclaw-session-search-probe.err; then
     log "session-search gateway probe succeeded"
