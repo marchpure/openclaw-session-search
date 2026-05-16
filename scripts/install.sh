@@ -133,13 +133,13 @@ install_plugin() {
   if command -v curl >/dev/null 2>&1; then
     log "downloading plugin package: $PACKAGE_URL"
     if curl -fsSL "$PACKAGE_URL" -o "$package_file"; then
-      OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force "$package_file"
+      OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force --dangerously-force-unsafe-install "$package_file"
       return
     fi
     log "package download failed; falling back to git install: $REPO_SPEC"
   fi
 
-  OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force "$REPO_SPEC"
+  OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force --dangerously-force-unsafe-install "$REPO_SPEC"
 }
 
 restart_gateway() {

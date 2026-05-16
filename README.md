@@ -45,7 +45,7 @@ conversationBindings: {
 }
 ```
 
-Then it restarts the OpenClaw gateway and probes the `session-search.search` Gateway method.
+Because the plugin intentionally invokes `rg` through `child_process` for deterministic local transcript search, the installer passes OpenClaw's `--dangerously-force-unsafe-install` plugin-install flag. Then it restarts the OpenClaw gateway and probes the `session-search.search` Gateway method.
 
 ```bash
 openclaw gateway call session-search.search \
