@@ -45,6 +45,12 @@ From a chat channel that supports OpenClaw plugin commands, including Feishu/Lar
 
 The command returns deterministic text directly from the plugin. It does not call a model.
 
+For the complete `/session-search` to `/resume` to `/resume <target>` workflow, see:
+
+```text
+docs/end-to-end-session-search-resume.md
+```
+
 ## Named Session Resume
 
 The plugin also implements the named-session resume behavior from OpenClaw PR 82112 as a plugin command:
