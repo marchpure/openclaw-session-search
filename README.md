@@ -51,6 +51,12 @@ For the complete `/session-search` to `/resume` to `/resume <target>` workflow, 
 docs/end-to-end-session-search-resume.md
 ```
 
+For a Lark/Feishu-flavored Markdown version suitable for `feishu_create_doc`, see:
+
+```text
+docs/feishu-session-search-resume.md
+```
+
 ## Named Session Resume
 
 The plugin also implements the named-session resume behavior from OpenClaw PR 82112 as a plugin command:
