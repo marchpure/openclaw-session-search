@@ -166,11 +166,24 @@ restart_gateway() {
 }
 
 verify_install() {
-  openclaw plugins doctor >/tmp/openclaw-session-search-plugins-doctor.log 2>&1 || {
-    log "plugins doctor reported issues"
-    sed -n '1,160p' /tmp/openclaw-session-search-plugins-doctor.log >&2
+  if [ ! -f "$OPENCLAW_STATE_DIR_RESOLVED/extensions/session-search/index.js" ]; then
+    log "installed plugin entrypoint not found at $OPENCLAW_STATE_DIR_RESOLVED/extensions/session-search/index.js"
+    exit 1
+  fi
+
+  node --check "$OPENCLAW_STATE_DIR_RESOLVED/extensions/session-search/index.js" >/tmp/openclaw-session-search-node-check.log 2>&1 || {
+    log "installed plugin entrypoint failed node --check"
+    sed -n '1,120p' /tmp/openclaw-session-search-node-check.log >&2
     exit 1
   }
+
+  timeout 20s openclaw plugins inspect "$PLUGIN_ID" >/tmp/openclaw-session-search-inspect.log 2>&1 || {
+    log "plugin inspect did not complete successfully"
+    sed -n '1,160p' /tmp/openclaw-session-search-inspect.log >&2
+    exit 1
+  }
+
+  log "plugin static verification succeeded"
 
   if [ "$SKIP_GATEWAY_RESTART" = "1" ]; then
     log "gateway probe skipped because gateway restart was skipped"
