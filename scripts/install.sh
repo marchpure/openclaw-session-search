@@ -5,7 +5,14 @@ PLUGIN_ID="session-search"
 DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/openclaw-session-search-0.1.0.tgz"
 DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git"
 
-OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
+if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
+  OPENCLAW_STATE_DIR_RESOLVED="$OPENCLAW_STATE_DIR"
+elif [ -n "${OPENCLAW_HOME:-}" ]; then
+  OPENCLAW_STATE_DIR_RESOLVED="$OPENCLAW_HOME/.openclaw"
+else
+  OPENCLAW_STATE_DIR_RESOLVED="$HOME/.openclaw"
+fi
+
 PACKAGE_URL="${OPENCLAW_SESSION_SEARCH_PACKAGE_URL:-$DEFAULT_PACKAGE_URL}"
 REPO_SPEC="${OPENCLAW_SESSION_SEARCH_REPO_SPEC:-$DEFAULT_REPO_SPEC}"
 SKIP_GATEWAY_RESTART="${OPENCLAW_SESSION_SEARCH_SKIP_GATEWAY_RESTART:-0}"
@@ -26,7 +33,7 @@ patch_lark_conversation_bindings() {
 const fs = require('fs');
 const path = require('path');
 
-const home = process.env.OPENCLAW_HOME || path.join(process.env.HOME || '/root', '.openclaw');
+const home = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME || '/root', '.openclaw');
 const candidates = [
   path.join(home, 'extensions', 'openclaw-lark'),
   path.join(home, 'extensions', 'feishu'),
@@ -133,13 +140,13 @@ install_plugin() {
   if command -v curl >/dev/null 2>&1; then
     log "downloading plugin package: $PACKAGE_URL"
     if curl -fsSL "$PACKAGE_URL" -o "$package_file"; then
-      OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force --dangerously-force-unsafe-install "$package_file"
+      openclaw plugins install --force --dangerously-force-unsafe-install "$package_file"
       return
     fi
     log "package download failed; falling back to git install: $REPO_SPEC"
   fi
 
-  OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins install --force --dangerously-force-unsafe-install "$REPO_SPEC"
+  openclaw plugins install --force --dangerously-force-unsafe-install "$REPO_SPEC"
 }
 
 restart_gateway() {
@@ -148,7 +155,7 @@ restart_gateway() {
     return
   fi
 
-  if OPENCLAW_HOME="$OPENCLAW_HOME" openclaw gateway restart >/tmp/openclaw-session-search-gateway-restart.log 2>&1; then
+  if openclaw gateway restart >/tmp/openclaw-session-search-gateway-restart.log 2>&1; then
     log "gateway restarted"
     return
   fi
@@ -159,13 +166,13 @@ restart_gateway() {
 }
 
 verify_install() {
-  OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins doctor >/tmp/openclaw-session-search-plugins-doctor.log 2>&1 || {
+  openclaw plugins doctor >/tmp/openclaw-session-search-plugins-doctor.log 2>&1 || {
     log "plugins doctor reported issues"
     sed -n '1,160p' /tmp/openclaw-session-search-plugins-doctor.log >&2
     exit 1
   }
 
-  if OPENCLAW_HOME="$OPENCLAW_HOME" openclaw gateway call session-search.search \
+  if openclaw gateway call session-search.search \
       --params '{"query":"__openclaw_session_search_install_probe__","agentId":"main","limit":1,"sinceDays":2}' \
       --json >/tmp/openclaw-session-search-probe.json 2>/tmp/openclaw-session-search-probe.err; then
     log "session-search gateway probe succeeded"
@@ -180,12 +187,12 @@ main() {
   need_cmd openclaw
   need_cmd node
 
-  log "OPENCLAW_HOME=$OPENCLAW_HOME"
+  log "OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR_RESOLVED"
   install_plugin
-  OPENCLAW_HOME="$OPENCLAW_HOME" openclaw plugins enable "$PLUGIN_ID" || true
+  openclaw plugins enable "$PLUGIN_ID" || true
 
   log "patching openclaw-lark conversation binding support"
-  OPENCLAW_HOME="$OPENCLAW_HOME" patch_lark_conversation_bindings
+  OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR_RESOLVED" patch_lark_conversation_bindings
 
   restart_gateway
   verify_install
