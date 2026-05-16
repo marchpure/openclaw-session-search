@@ -31,6 +31,22 @@ Optional flags can include hidden classes for operator diagnostics:
 
 ## Example
 
+## One-command Install
+
+```bash
+curl -fsSL https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/install.sh | bash
+```
+
+The installer downloads the plugin package, installs and enables the plugin, patches the installed `openclaw-lark` Feishu channel with:
+
+```js
+conversationBindings: {
+  supportsCurrentConversationBinding: true,
+}
+```
+
+Then it restarts the OpenClaw gateway and probes the `session-search.search` Gateway method.
+
 ```bash
 openclaw gateway call session-search.search \
   --params '{"query":"resume task","agentId":"main","sinceDays":2,"limit":8}' \

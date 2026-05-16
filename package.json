@@ -8,7 +8,8 @@
   "files": [
     "index.js",
     "openclaw.plugin.json",
-    "README.md"
+    "README.md",
+    "scripts/install.sh"
   ],
   "scripts": {
     "check": "node --check index.js"
@@ -24,4 +25,3 @@
     "openclaw": "*"
   }
 }
-
