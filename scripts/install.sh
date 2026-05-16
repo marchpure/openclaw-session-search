@@ -149,6 +149,37 @@ install_plugin() {
   openclaw plugins install --force --dangerously-force-unsafe-install "$REPO_SPEC"
 }
 
+configure_plugin() {
+  openclaw config patch --stdin <<'JSON'
+{
+  "plugins": {
+    "entries": {
+      "session-search": {
+        "enabled": true,
+        "config": {
+          "enabled": true,
+          "backend": "rg",
+          "fallbackToNode": true,
+          "defaultLimit": 8,
+          "maxSessions": 200,
+          "maxCharsPerMessage": 800,
+          "maxTranscriptBytes": 262144,
+          "maxFiles": 1000,
+          "sinceDays": 2,
+          "timeoutMs": 3000,
+          "rgBatchSize": 200,
+          "includeAssistantByDefault": true,
+          "includeCron": false,
+          "includeSubagents": false,
+          "includeInternal": false
+        }
+      }
+    }
+  }
+}
+JSON
+}
+
 restart_gateway() {
   if [ "$SKIP_GATEWAY_RESTART" = "1" ]; then
     log "gateway restart skipped by OPENCLAW_SESSION_SEARCH_SKIP_GATEWAY_RESTART=1"
@@ -208,6 +239,7 @@ main() {
   log "OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR_RESOLVED"
   install_plugin
   openclaw plugins enable "$PLUGIN_ID" || true
+  configure_plugin
 
   log "patching openclaw-lark conversation binding support"
   OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR_RESOLVED" patch_lark_conversation_bindings

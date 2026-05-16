@@ -37,7 +37,7 @@ Optional flags can include hidden classes for operator diagnostics:
 curl -fsSL https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/install.sh | bash
 ```
 
-The installer downloads the plugin package, installs and enables the plugin, patches the installed `openclaw-lark` Feishu channel with:
+The installer downloads the plugin package, installs and enables the plugin, writes the plugin runtime config (`plugins.entries.session-search.config.enabled=true`), and patches the installed `openclaw-lark` Feishu channel with:
 
 ```js
 conversationBindings: {
