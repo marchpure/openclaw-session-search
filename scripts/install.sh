@@ -169,6 +169,7 @@ configure_plugin() {
           "timeoutMs": 3000,
           "rgBatchSize": 200,
           "includeAssistantByDefault": true,
+          "excludePluginOutputs": true,
           "includeCron": false,
           "includeSubagents": false,
           "includeInternal": false

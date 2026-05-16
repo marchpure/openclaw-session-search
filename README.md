@@ -107,6 +107,7 @@ The plugin also implements the named-session resume behavior from OpenClaw PR 82
   "timeoutMs": 3000,
   "rgBatchSize": 200,
   "includeAssistantByDefault": true,
+  "excludePluginOutputs": true,
   "includeCron": false,
   "includeSubagents": false,
   "includeInternal": false

@@ -159,6 +159,16 @@ function createFixture() {
       message("assistant", "gamma reply", now - 20000),
     ],
   });
+  addSession({
+    key: "agent:main:web-self-search",
+    label: "/session-search 你好",
+    sessionId: "web-self-search",
+    updatedAt: now - 15000,
+    messages: [
+      sessionHeader("web-self-search", now - 16000),
+      message("assistant", "历史会话搜索：你好\n\n结果 0 条 | 可见会话 0 个 | 过滤 0 个 | 3ms (rg)\n\n未找到匹配的用户可见会话。", now - 15000),
+    ],
+  });
 
   for (let i = 0; i < visibleCount; i += 1) {
     const key = `agent:main:bulk-${i}`;
@@ -278,9 +288,12 @@ addCase(cases, "search filters cron by default", searchHello.filteredCron === 12
 addCase(cases, "search filters subagents by default", searchHello.filteredSubagent === 120, "filtering");
 addCase(cases, "search exposes hit timestamp", searchHello.results.every((row) => row.timestamp), "display");
 addCase(cases, "search exposes resume key", searchHello.results.every((row) => row.key), "display");
+addCase(cases, "search excludes plugin generated assistant replies", searchHello.results.every((row) => !String(row.snippet || "").includes("未找到匹配的用户可见会话")), "filtering");
+addCase(cases, "search filters plugin command sessions", searchHello.results.every((row) => row.key !== "agent:main:web-self-search"), "filtering");
 
 const resumeList = await callMethod(methods, "session-search.resume", { agentId: "main" });
 addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3003, "functional");
+addCase(cases, "resume filters plugin command sessions", !resumeList.sessions.some((row) => row.key === "agent:main:web-self-search"), "filtering");
 addCase(cases, "resume filters cron", resumeList.stats.filteredCron === 120, "filtering");
 addCase(cases, "resume filters subagents", resumeList.stats.filteredSubagent === 120, "filtering");
 addCase(cases, "resume includes unnamed main by key", resumeList.sessions.some((row) => row.key === "agent:main:main" && row.displayName === "agent:main:main"), "usability");
@@ -436,8 +449,8 @@ for (let i = 0; i < 16; i += 1) {
 const totalMs = performance.now() - t0;
 addCase(cases, "total e2e under 15000ms", totalMs < 15000, "performance");
 
-if (cases.length !== 300) {
-  throw new Error(`FAIL expected 300 cases, got ${cases.length}`);
+if (cases.length !== 303) {
+  throw new Error(`FAIL expected 303 cases, got ${cases.length}`);
 }
 
 const byCategory = cases.reduce((acc, item) => {

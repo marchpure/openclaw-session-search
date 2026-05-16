@@ -18,6 +18,7 @@ const DEFAULTS = {
   timeoutMs: 3000,
   rgBatchSize: 200,
   includeAssistantByDefault: true,
+  excludePluginOutputs: true,
   includeCron: false,
   includeSubagents: false,
   includeInternal: false,
@@ -64,6 +65,10 @@ function resolveConfig(raw) {
       typeof cfg.includeAssistantByDefault === "boolean"
         ? cfg.includeAssistantByDefault
         : DEFAULTS.includeAssistantByDefault,
+    excludePluginOutputs:
+      typeof cfg.excludePluginOutputs === "boolean"
+        ? cfg.excludePluginOutputs
+        : DEFAULTS.excludePluginOutputs,
     includeCron: typeof cfg.includeCron === "boolean" ? cfg.includeCron : DEFAULTS.includeCron,
     includeSubagents:
       typeof cfg.includeSubagents === "boolean" ? cfg.includeSubagents : DEFAULTS.includeSubagents,
@@ -109,6 +114,11 @@ function stringFromEntry(entry, key) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function isPluginCommandSession(entry) {
+  const label = stringFromEntry(entry, "label");
+  return /^\/(?:session-search|resume)(?:\s|$)/i.test(label);
+}
+
 function hasUserVisibleChannel(entry) {
   const origin = asRecord(entry.origin);
   const deliveryContext = asRecord(entry.deliveryContext);
@@ -123,6 +133,9 @@ function hasUserVisibleChannel(entry) {
 }
 
 function classifySessionVisibility(key, entry) {
+  if (isPluginCommandSession(entry)) {
+    return "tool";
+  }
   if (hasPathSegment(key, "subagent") || stringFromEntry(entry, "spawnedBy") || stringFromEntry(entry, "subagentRole")) {
     return "subagent";
   }
@@ -355,6 +368,22 @@ function scoreText(text, terms) {
   return score;
 }
 
+function isPluginGeneratedTranscriptText(text) {
+  const normalized = cleanTranscriptText(text);
+  if (!normalized) return false;
+  if (/^历史会话搜索：/.test(normalized)) return true;
+  if (/^可恢复会话：/.test(normalized)) return true;
+  if (/^已恢复会话：/.test(normalized)) return true;
+  if (/^恢复会话失败：/.test(normalized)) return true;
+  if (/^Session search is disabled\./.test(normalized)) return true;
+  if (/^Session resume is disabled\./.test(normalized)) return true;
+  if (/结果 \d+ 条 \| 可见会话 \d+ 个 \| 过滤 \d+ 个 \| \d+ms \((?:rg|node)\)/.test(normalized)) return true;
+  if (normalized.includes("未找到匹配的用户可见会话。")) return true;
+  if (normalized.includes("使用：/resume <会话或恢复ID>")) return true;
+  if (normalized.includes("后续消息会继续进入这个会话。")) return true;
+  return false;
+}
+
 function snippet(text, terms, maxChars) {
   const cleaned = cleanTranscriptText(text);
   text = cleaned || text;
@@ -443,6 +472,7 @@ function searchTranscriptNode(session, terms, opts) {
     if (!msg) continue;
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
+    if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
     const score = scoreText(msg.text, terms);
     if (score <= 0) continue;
     hits.push({
@@ -551,6 +581,7 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
     if (!msg) continue;
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
+    if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
     const score = scoreText(msg.text, terms);
     hits.push({
       score: score > 0 ? score : 1,
@@ -609,6 +640,7 @@ function searchWithNode(sessions, terms, opts) {
     hits: sessions.flatMap((session) =>
       searchTranscriptNode(session, terms, {
         includeAssistant: opts.includeAssistant,
+        excludePluginOutputs: opts.excludePluginOutputs,
         maxChars: opts.maxChars,
         maxTranscriptBytes: opts.maxTranscriptBytes,
       }),
@@ -962,6 +994,7 @@ async function sessionSearch(params, cfg) {
     maxTranscriptBytes,
     timeoutMs,
     rgBatchSize,
+    excludePluginOutputs: cfg.excludePluginOutputs,
   };
   let search =
     cfg.backend === "rg"

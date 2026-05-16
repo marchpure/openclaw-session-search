@@ -96,6 +96,10 @@
         "type": "boolean",
         "default": true
       },
+      "excludePluginOutputs": {
+        "type": "boolean",
+        "default": true
+      },
       "includeCron": {
         "type": "boolean",
         "default": false
