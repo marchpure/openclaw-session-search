@@ -140,3 +140,11 @@ node scripts/validate-live-openclaw.mjs
 ```
 
 The live matrix calls the running `openclaw gateway call` binary only, using the current real OpenClaw state and real session transcripts. It runs 3000 assertions over the data returned by live `/resume` and `/session-search` plugin Gateway methods, including real resume bindings against the current Feishu conversation. The script snapshots and restores `~/.openclaw/bindings/current-conversations.json` after the run.
+
+Run the synthetic performance benchmark:
+
+```bash
+node scripts/benchmark-search.mjs
+```
+
+The benchmark builds temporary 1k, 5k, and 10k session fixtures, mixes in oversized transcripts, and measures `/resume`, `rg` search, Node fallback search, and zero-hit search latency.

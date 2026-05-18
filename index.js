@@ -439,11 +439,7 @@ function searchableSessions(sessions, opts) {
       continue;
     }
     const size = fs.statSync(session.sessionFile).size;
-    if (size > opts.maxTranscriptBytes) {
-      skippedLarge += 1;
-      continue;
-    }
-    accepted.push({ ...session, size });
+    accepted.push({ ...session, size, tailOnly: size > opts.maxTranscriptBytes });
     if (accepted.length >= opts.maxFiles) break;
   }
   return { sessions: accepted, skippedMissing, skippedLarge, skippedUnsafePath };
@@ -602,10 +598,12 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
 
 async function searchWithRg(sessions, terms, opts) {
   const rgCommand = findRgCommand();
+  const rgSessions = sessions.filter((session) => !session.tailOnly);
+  const tailSessions = sessions.filter((session) => session.tailOnly);
   const sessionByFile = new Map(
-    sessions.map((session) => [path.resolve(session.sessionFile), session]),
+    rgSessions.map((session) => [path.resolve(session.sessionFile), session]),
   );
-  const files = sessions.map((session) => session.sessionFile);
+  const files = rgSessions.map((session) => session.sessionFile);
   const hits = [];
   let timedOut = false;
   let failed = false;
@@ -623,7 +621,20 @@ async function searchWithRg(sessions, terms, opts) {
     hits.push(...parseRgMatches(result.stdout, sessionByFile, terms, opts));
     if (hits.length >= opts.limit * 8 || timedOut || failed) break;
   }
-  return { hits, meta: { backend: "rg", rgCommand, timedOut, failed, stderr } };
+  if (!timedOut && !failed && hits.length < opts.limit * 8 && tailSessions.length > 0) {
+    hits.push(...searchWithNode(tailSessions, terms, opts).hits);
+  }
+  return {
+    hits,
+    meta: {
+      backend: "rg",
+      rgCommand,
+      timedOut,
+      failed,
+      stderr,
+      tailScannedLargeFiles: tailSessions.length,
+    },
+  };
 }
 
 function attachTranscriptSummaries(sessions) {

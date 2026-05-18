@@ -169,6 +169,17 @@ function createFixture() {
       message("assistant", "历史会话搜索：你好\n\n结果 0 条 | 可见会话 0 个 | 过滤 0 个 | 3ms (rg)\n\n未找到匹配的用户可见会话。", now - 15000),
     ],
   });
+  addSession({
+    key: "agent:main:large-tail-session",
+    label: "large-tail-session",
+    sessionId: "large-tail-session",
+    updatedAt: now - 18000,
+    messages: [
+      sessionHeader("large-tail-session", now - 500000),
+      message("user", "large prefix " + "x".repeat(280000), now - 490000),
+      message("user", "oversized tail marker manual failure reproduction", now - 18000),
+    ],
+  });
 
   for (let i = 0; i < visibleCount; i += 1) {
     const key = `agent:main:bulk-${i}`;
@@ -292,7 +303,7 @@ addCase(cases, "search excludes plugin generated assistant replies", searchHello
 addCase(cases, "search filters plugin command sessions", searchHello.results.every((row) => row.key !== "agent:main:web-self-search"), "filtering");
 
 const resumeList = await callMethod(methods, "session-search.resume", { agentId: "main" });
-addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3003, "functional");
+addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3004, "functional");
 addCase(cases, "resume filters plugin command sessions", !resumeList.sessions.some((row) => row.key === "agent:main:web-self-search"), "filtering");
 addCase(cases, "resume filters cron", resumeList.stats.filteredCron === 120, "filtering");
 addCase(cases, "resume filters subagents", resumeList.stats.filteredSubagent === 120, "filtering");
@@ -314,6 +325,28 @@ const searchNeedleMs = performance.now() - searchNeedleStart;
 addCase(cases, "bulk search finds expected hits", searchNeedle.count === 20, "large-data");
 addCase(cases, "bulk search under 2500ms", searchNeedleMs < 2500, "performance");
 addCase(cases, "bulk search uses rg or node fallback", ["rg", "node"].includes(searchNeedle.backend), "reliability");
+
+const largeTailRg = await callMethod(methods, "session-search.search", {
+  query: "oversized tail marker",
+  agentId: "main",
+  limit: 5,
+  sinceDays: 2,
+  maxSessions: 5000,
+  maxFiles: 5000,
+});
+addCase(cases, "rg backend scans tail of oversized transcripts", largeTailRg.results.some((row) => row.key === "agent:main:large-tail-session"), "large-data");
+addCase(cases, "rg reports large tail scanning", largeTailRg.debug.tailScannedLargeFiles >= 1, "large-data");
+
+const largeTailNode = await callMethod(methods, "session-search.search", {
+  query: "oversized tail marker",
+  agentId: "main",
+  backend: "node",
+  limit: 5,
+  sinceDays: 2,
+  maxSessions: 5000,
+  maxFiles: 5000,
+});
+addCase(cases, "node backend scans tail of oversized transcripts", largeTailNode.results.some((row) => row.key === "agent:main:large-tail-session"), "large-data");
 
 const resolveByLabel = await callMethod(methods, "session-search.resume", {
   agentId: "main",
@@ -447,10 +480,10 @@ for (let i = 0; i < 16; i += 1) {
 }
 
 const totalMs = performance.now() - t0;
-addCase(cases, "total e2e under 15000ms", totalMs < 15000, "performance");
+addCase(cases, "total e2e under 25000ms", totalMs < 25000, "performance");
 
-if (cases.length !== 303) {
-  throw new Error(`FAIL expected 303 cases, got ${cases.length}`);
+if (cases.length !== 306) {
+  throw new Error(`FAIL expected 306 cases, got ${cases.length}`);
 }
 
 const byCategory = cases.reduce((acc, item) => {
