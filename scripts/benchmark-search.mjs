@@ -100,7 +100,9 @@ function createFixture(totalSessions) {
       ),
       message(
         "user",
-        hasNeedle ? `benchmark needle phrase ${i}` : `closing benchmark message ${i}`,
+        hasNeedle
+          ? `benchmark needle phrase ${i} google博客 郝行军背景 memory-lancedb-pro foo.bar(baz) 2026/5/16 16:30:35`
+          : `closing benchmark message ${i}`,
         now - 30000 - i,
       ),
     ];
@@ -206,6 +208,16 @@ for (const scale of SCALE_SET) {
       maxFiles: scale,
     }),
   );
+  const mixedQuery = await timed(() =>
+    callMethod(methods, "session-search.search", {
+      query: "google博客 foo.bar(baz) 2026/5/16 16:30:35",
+      agentId: "main",
+      limit: 20,
+      sinceDays: 2,
+      maxSessions: scale,
+      maxFiles: scale,
+    }),
+  );
   runs.push({
     scale,
     largeFiles: LARGE_FILES,
@@ -213,8 +225,10 @@ for (const scale of SCALE_SET) {
     rgNeedleMs: rgNeedle.ms,
     nodeNeedleMs: nodeNeedle.ms,
     zeroHitMs: zeroHit.ms,
+    mixedQueryMs: mixedQuery.ms,
     rgHits: rgNeedle.result.count,
     nodeHits: nodeNeedle.result.count,
+    mixedHits: mixedQuery.result.count,
     tailScannedLargeFiles: rgNeedle.result.debug.tailScannedLargeFiles,
     searchedFiles: rgNeedle.result.searchedFiles,
   });

@@ -180,6 +180,34 @@ function createFixture() {
       message("user", "oversized tail marker manual failure reproduction", now - 18000),
     ],
   });
+  addSession({
+    key: "agent:main:manual-time-session",
+    label: "manual-time-session",
+    sessionId: "manual-time-session",
+    updatedAt: now - 19000,
+    messages: [
+      sessionHeader("manual-time-session", new Date("2026-05-16T08:30:35Z").getTime()),
+      message("user", "这个会话发生在 2020-08 的时候，记录了 202008 的历史背景。", new Date("2026-05-16T08:30:35Z").getTime()),
+      message("assistant", "manual time reply", now - 19000),
+    ],
+  });
+  addSession({
+    key: "agent:main:manual-keyword-session",
+    label: "manual-keyword-session",
+    sessionId: "manual-keyword-session",
+    updatedAt: now - 21000,
+    messages: [
+      sessionHeader("manual-keyword-session", now - 600000),
+      message("user", "阅读 google 官方博客，总结郝行军的技术背景，涉及 memory-lancedb 和 memory-lancedb-pro 配置。", now - 590000),
+      message("assistant", "代码符号示例：foo.bar(baz) path/to/file.js error_code=E_CONN_RESET", now - 21000),
+    ],
+  });
+
+  writeJsonl(path.join(sessionsDir, "legacy-viking-session.jsonl"), [
+    sessionHeader("legacy-viking-session", now - 700000),
+    message("user", "安装插件前的历史 session 包含 viking 项目讨论。", now - 690000),
+    message("assistant", "legacy viking reply", now - 680000),
+  ]);
 
   for (let i = 0; i < visibleCount; i += 1) {
     const key = `agent:main:bulk-${i}`;
@@ -303,7 +331,7 @@ addCase(cases, "search excludes plugin generated assistant replies", searchHello
 addCase(cases, "search filters plugin command sessions", searchHello.results.every((row) => row.key !== "agent:main:web-self-search"), "filtering");
 
 const resumeList = await callMethod(methods, "session-search.resume", { agentId: "main" });
-addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3004, "functional");
+addCase(cases, "resume lists visible sessions", resumeList.sessions.length === 3007, "functional");
 addCase(cases, "resume filters plugin command sessions", !resumeList.sessions.some((row) => row.key === "agent:main:web-self-search"), "filtering");
 addCase(cases, "resume filters cron", resumeList.stats.filteredCron === 120, "filtering");
 addCase(cases, "resume filters subagents", resumeList.stats.filteredSubagent === 120, "filtering");
@@ -347,6 +375,39 @@ const largeTailNode = await callMethod(methods, "session-search.search", {
   maxFiles: 5000,
 });
 addCase(cases, "node backend scans tail of oversized transcripts", largeTailNode.results.some((row) => row.key === "agent:main:large-tail-session"), "large-data");
+
+const manualCases = [
+  ["manual query finds legacy pre-install transcript", "viking", "agent:main:legacy:legacy-viking-session"],
+  ["manual query finds slash date timestamp", "2026/5/16 16:30:35", "agent:main:manual-time-session"],
+  ["manual query finds compact year month", "202008的时候", "agent:main:manual-time-session"],
+  ["manual query finds hyphenated package", "memory-lancedb", "agent:main:manual-keyword-session"],
+  ["manual query finds longer hyphenated package", "memory-lancedb-pro", "agent:main:manual-keyword-session"],
+  ["manual query finds mixed latin han keywords", "google博客", "agent:main:manual-keyword-session"],
+  ["manual query finds adjacent han keywords", "郝行军背景", "agent:main:manual-keyword-session"],
+  ["manual query finds code symbol", "foo.bar(baz)", "agent:main:manual-keyword-session"],
+];
+
+for (const [name, query, expectedKey] of manualCases) {
+  const result = await callMethod(methods, "session-search.search", {
+    query,
+    agentId: "main",
+    limit: 8,
+    sinceDays: 3650,
+    maxSessions: 5000,
+    maxFiles: 5000,
+  });
+  addCase(cases, name, result.results.some((row) => row.key === expectedKey), "manual-regression");
+}
+
+const multiKeywordRanking = await callMethod(methods, "session-search.search", {
+  query: "google博客",
+  agentId: "main",
+  limit: 3,
+  sinceDays: 3650,
+  maxSessions: 5000,
+  maxFiles: 5000,
+});
+addCase(cases, "multi keyword ranks combined match first", multiKeywordRanking.results[0]?.key === "agent:main:manual-keyword-session", "manual-regression");
 
 const resolveByLabel = await callMethod(methods, "session-search.resume", {
   agentId: "main",
@@ -482,8 +543,8 @@ for (let i = 0; i < 16; i += 1) {
 const totalMs = performance.now() - t0;
 addCase(cases, "total e2e under 25000ms", totalMs < 25000, "performance");
 
-if (cases.length !== 306) {
-  throw new Error(`FAIL expected 306 cases, got ${cases.length}`);
+if (cases.length !== 315) {
+  throw new Error(`FAIL expected 315 cases, got ${cases.length}`);
 }
 
 const byCategory = cases.reduce((acc, item) => {

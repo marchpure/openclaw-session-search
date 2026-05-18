@@ -98,6 +98,14 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+function safeReadJson(filePath) {
+  try {
+    return readJson(filePath);
+  } catch {
+    return {};
+  }
+}
+
 function hasPathSegment(key, segment) {
   return key.split(":").includes(segment);
 }
@@ -173,11 +181,18 @@ function listSessionEntries(agentId, opts) {
     filteredTool: 0,
     filteredInternal: 0,
   };
-  if (!fs.existsSync(storePath)) return { sessions: [], stats };
+  if (!fs.existsSync(storePath) && !fs.existsSync(dir)) return { sessions: [], stats };
   const cutoff =
     opts.sinceDays > 0 ? nowMs() - opts.sinceDays * 24 * 60 * 60 * 1000 : Number.NEGATIVE_INFINITY;
-  const store = readJson(storePath);
-  const sessions = Object.entries(asRecord(store))
+  const store = fs.existsSync(storePath) ? safeReadJson(storePath) : {};
+  const indexed = Object.entries(asRecord(store));
+  const indexedSessionIds = new Set(
+    indexed
+      .map(([, entry]) => asRecord(entry).sessionId)
+      .filter((sessionId) => typeof sessionId === "string" && sessionId),
+  );
+  const legacy = listLegacyTranscriptEntries(dir, indexedSessionIds);
+  const sessions = [...indexed, ...legacy]
     .map(([key, entry]) => ({ key, entry: asRecord(entry) }))
     .filter(({ entry }) => typeof entry.sessionId === "string")
     .filter(({ entry }) => Number(entry.updatedAt || 0) >= cutoff)
@@ -204,6 +219,42 @@ function listSessionEntries(agentId, opts) {
       sessionFile: resolveSessionFile(dir, entry),
     }));
   return { sessions, stats };
+}
+
+function listLegacyTranscriptEntries(dir, indexedSessionIds) {
+  if (!fs.existsSync(dir)) return [];
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.endsWith(".jsonl"))
+    .filter((name) => !indexedSessionIds.has(path.basename(name, ".jsonl")))
+    .map((name) => {
+      const sessionId = path.basename(name, ".jsonl");
+      const sessionFile = path.join(dir, name);
+      let updatedAt = 0;
+      try {
+        updatedAt = fs.statSync(sessionFile).mtimeMs;
+      } catch {
+        updatedAt = 0;
+      }
+      return [
+        `agent:main:legacy:${sessionId}`,
+        {
+          sessionId,
+          sessionFile,
+          updatedAt,
+          label: sessionId,
+          chatType: "direct",
+          lastChannel: "legacy",
+          origin: { provider: "legacy", surface: "sessions" },
+          deliveryContext: { channel: "legacy" },
+        },
+      ];
+    });
 }
 
 function parseAgentIdFromSessionKey(key) {
@@ -346,26 +397,89 @@ function resolveResumableSession(agentId, target, cfg) {
   return { ok: false, code: "not_found", matches: [] };
 }
 
+function splitScriptRuns(text) {
+  return String(text ?? "")
+    .match(/[\p{Script=Han}]+|[\p{Script=Latin}\p{N}_-]+|[^\s\p{L}\p{N}]+/gu) ?? [];
+}
+
+function hanBigrams(text) {
+  const grams = [];
+  for (const run of String(text ?? "").match(/[\p{Script=Han}]{3,}/gu) ?? []) {
+    const chars = Array.from(run);
+    for (let i = 0; i < chars.length - 1; i += 1) {
+      grams.push(`${chars[i]}${chars[i + 1]}`);
+    }
+  }
+  return grams;
+}
+
+function normalizeTimeLikeTokens(text) {
+  const source = String(text ?? "");
+  const tokens = [];
+  const dateTime = source.match(
+    /(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/,
+  );
+  if (dateTime) {
+    const [, year, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw] = dateTime;
+    const month = monthRaw.padStart(2, "0");
+    const day = dayRaw.padStart(2, "0");
+    const hour = hourRaw?.padStart(2, "0");
+    const minute = minuteRaw?.padStart(2, "0");
+    const second = secondRaw?.padStart(2, "0");
+    tokens.push(`${year}-${month}-${day}`, `${year}/${Number(month)}/${Number(day)}`, `${year}${month}${day}`);
+    if (hour && minute) {
+      tokens.push(`${hour}:${minute}`, `${Number(hour)}:${minute}`);
+      if (second) tokens.push(`${hour}:${minute}:${second}`, `${Number(hour)}:${minute}:${second}`);
+    }
+  }
+  for (const compact of source.match(/\d{6,14}/g) ?? []) {
+    tokens.push(compact);
+    if (compact.length >= 6) {
+      tokens.push(`${compact.slice(0, 4)}-${compact.slice(4, 6)}`);
+      tokens.push(`${compact.slice(0, 4)}/${Number(compact.slice(4, 6))}`);
+    }
+    if (compact.length >= 8) {
+      tokens.push(`${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`);
+      tokens.push(`${compact.slice(0, 4)}/${Number(compact.slice(4, 6))}/${Number(compact.slice(6, 8))}`);
+    }
+  }
+  return tokens;
+}
+
 function tokenize(text) {
-  return text
+  const raw = String(text ?? "").trim();
+  const tokens = raw
     .toLowerCase()
     .split(/[^\p{L}\p{N}_-]+/u)
     .map((item) => item.trim())
     .filter((item) => item.length >= 2);
+  const scriptTokens = splitScriptRuns(raw)
+    .map((item) => item.toLowerCase().trim())
+    .filter((item) => item.length >= 2);
+  const hanTokens = hanBigrams(raw);
+  const timeTokens = normalizeTimeLikeTokens(raw).map((item) => item.toLowerCase());
+  const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
+    .map((item) => item.toLowerCase().trim())
+    .filter((item) => item.length >= 2);
+  return Array.from(new Set([raw.toLowerCase(), ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens]));
 }
 
-function scoreText(text, terms) {
+function matchText(text, terms) {
   const lower = text.toLowerCase();
   let score = 0;
+  let matchedTerms = 0;
   for (const term of terms) {
     if (!term) continue;
     let index = lower.indexOf(term);
+    let matched = false;
     while (index !== -1) {
       score += term.length >= 4 ? 3 : 1;
+      matched = true;
       index = lower.indexOf(term, index + term.length);
     }
+    if (matched) matchedTerms += 1;
   }
-  return score;
+  return { score: score + Math.max(0, matchedTerms - 1) * 5, matchedTerms };
 }
 
 function isPluginGeneratedTranscriptText(text) {
@@ -469,10 +583,12 @@ function searchTranscriptNode(session, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const score = scoreText(msg.text, terms);
+    const match = matchText(buildSearchText(session, msg), terms);
+    const score = match.score;
     if (score <= 0) continue;
     hits.push({
       score,
+      matchedTerms: match.matchedTerms,
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -578,9 +694,11 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const score = scoreText(msg.text, terms);
+    const match = matchText(buildSearchText(session, msg), terms);
+    const score = match.score;
     hits.push({
       score: score > 0 ? score : 1,
+      matchedTerms: match.matchedTerms,
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -644,6 +762,38 @@ function attachTranscriptSummaries(sessions) {
     displayName: sessionDisplayName(session),
     ...readTranscriptSummary(session.sessionFile),
   }));
+}
+
+function buildSearchText(session, msg) {
+  const parts = [
+    msg.text,
+    session.key,
+    session.label,
+    session.sessionId,
+    formatSearchTimestamp(msg.timestamp),
+    formatSearchTimestamp(session.createdAt),
+    formatSearchTimestamp(session.lastMessageAt),
+    formatSearchTimestamp(session.updatedAt),
+  ];
+  return parts.filter(Boolean).join("\n");
+}
+
+function formatSearchTimestamp(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const date = new Date(n);
+  const local = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
+  const year = local.getFullYear();
+  const month = String(local.getMonth() + 1).padStart(2, "0");
+  const day = String(local.getDate()).padStart(2, "0");
+  const hour = String(local.getHours()).padStart(2, "0");
+  const minute = String(local.getMinutes()).padStart(2, "0");
+  const second = String(local.getSeconds()).padStart(2, "0");
+  return [
+    `${year}-${month}-${day} ${hour}:${minute}:${second}`,
+    `${year}/${Number(month)}/${Number(day)} ${Number(hour)}:${minute}:${second}`,
+    `${year}${month}${day}`,
+  ].join(" ");
 }
 
 function searchWithNode(sessions, terms, opts) {
@@ -1018,6 +1168,7 @@ async function sessionSearch(params, cfg) {
   const results = search.hits
     .sort(
       (a, b) =>
+        Number(b.matchedTerms || 0) - Number(a.matchedTerms || 0) ||
         b.score - a.score ||
         Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
           Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),

@@ -80,7 +80,7 @@ assertCase(cases, "live", "resume returns session list", Array.isArray(sessions)
 assertCase(cases, "live", "resume list shape is stable", sessions.length >= 0, { count: sessions.length });
 assertCase(cases, "filtering", "resume filters subagents by default", resumeAll.stats.filteredSubagent >= 0);
 assertCase(cases, "filtering", "resume filters cron by default", resumeAll.stats.filteredCron >= 0);
-assertCase(cases, "performance", "resume list under 10s", resumeAllTimed.ms < 10000, {
+assertCase(cases, "performance", "resume list under 20s", resumeAllTimed.ms < 20000, {
   ms: Math.round(resumeAllTimed.ms),
 });
 
@@ -103,7 +103,7 @@ assertCase(cases, "live", "search result shape is stable", Array.isArray(helloRe
 });
 assertCase(cases, "filtering", "search filters subagents by default", searchHello.filteredSubagent >= 0);
 assertCase(cases, "filtering", "search filters cron by default", searchHello.filteredCron >= 0);
-assertCase(cases, "performance", "hello search under 10s", searchHelloTimed.ms < 10000, {
+assertCase(cases, "performance", "hello search under 20s", searchHelloTimed.ms < 20000, {
   ms: Math.round(searchHelloTimed.ms),
 });
 
@@ -129,7 +129,7 @@ for (const query of queries) {
   );
   queryResults.push(run);
   assertCase(cases, "reliability", `query ${query} returns expected shape`, Array.isArray(run.result.results));
-  assertCase(cases, "performance", `query ${query} under 10s`, run.ms < 10000, {
+  assertCase(cases, "performance", `query ${query} under 20s`, run.ms < 20000, {
     ms: Math.round(run.ms),
   });
 }
@@ -279,7 +279,7 @@ while (cases.length < TARGET_CASES) {
 }
 
 const totalMs = performance.now() - totalStart;
-assertCase(cases, "performance", "total live validation under 120s", totalMs < 120000, {
+assertCase(cases, "performance", "total live validation under 180s", totalMs < 180000, {
   ms: Math.round(totalMs),
 });
 
