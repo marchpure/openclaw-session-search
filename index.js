@@ -413,6 +413,15 @@ function hanBigrams(text) {
   return grams;
 }
 
+function separatorVariants(tokens) {
+  const variants = [];
+  for (const token of tokens) {
+    if (token.includes("_")) variants.push(token.replaceAll("_", "-"));
+    if (token.includes("-")) variants.push(token.replaceAll("-", "_"));
+  }
+  return variants;
+}
+
 function normalizeTimeLikeTokens(text) {
   const source = String(text ?? "");
   const tokens = [];
@@ -461,7 +470,8 @@ function tokenize(text) {
   const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  return Array.from(new Set([raw.toLowerCase(), ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens]));
+  const baseTokens = [raw.toLowerCase(), ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens];
+  return Array.from(new Set([...baseTokens, ...separatorVariants(baseTokens)]));
 }
 
 function matchText(text, terms) {
@@ -776,6 +786,39 @@ function buildSearchText(session, msg) {
     formatSearchTimestamp(session.updatedAt),
   ];
   return parts.filter(Boolean).join("\n");
+}
+
+function buildSessionMetadataSearchText(session) {
+  return [
+    session.key,
+    session.label,
+    session.displayName,
+    session.sessionId,
+    formatSearchTimestamp(session.createdAt),
+    formatSearchTimestamp(session.lastMessageAt),
+    formatSearchTimestamp(session.updatedAt),
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function searchSessionMetadata(session, terms, opts) {
+  const match = matchText(buildSessionMetadataSearchText(session), terms);
+  if (match.score <= 0) return null;
+  return {
+    score: match.score,
+    matchedTerms: match.matchedTerms,
+    key: session.key,
+    label: session.label,
+    sessionId: session.sessionId,
+    updatedAt: session.updatedAt,
+    createdAt: session.createdAt,
+    lastMessageAt: session.lastMessageAt,
+    role: "system",
+    line: 0,
+    timestamp: session.lastMessageAt || session.updatedAt || session.createdAt,
+    snippet: snippet(buildSessionMetadataSearchText(session), terms, opts.maxChars),
+  };
 }
 
 function formatSearchTimestamp(value) {
@@ -1165,7 +1208,11 @@ async function sessionSearch(params, cfg) {
     search = searchWithNode(selectedSessions, terms, searchOpts);
     search.meta.fallbackFrom = "rg";
   }
+  const metadataHits = selectedSessions
+    .map((session) => searchSessionMetadata(session, terms, searchOpts))
+    .filter(Boolean);
   const results = search.hits
+    .concat(metadataHits)
     .sort(
       (a, b) =>
         Number(b.matchedTerms || 0) - Number(a.matchedTerms || 0) ||
