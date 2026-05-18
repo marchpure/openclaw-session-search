@@ -10,6 +10,14 @@ const pluginRoot = path.join(workRoot, "plugin");
 const stateRoot = path.join(workRoot, "state");
 const sessionsDir = path.join(stateRoot, "agents", "main", "sessions");
 const fakeDistDir = path.join(workRoot, "dist");
+const QUERY_CASES = intArg("cases", 3000);
+
+function intArg(name, fallback) {
+  const prefix = `--${name}=`;
+  const hit = process.argv.find((arg) => arg.startsWith(prefix));
+  const value = hit ? Number(hit.slice(prefix.length)) : fallback;
+  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+}
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -288,8 +296,12 @@ const cases = [];
 const timings = [];
 const started = performance.now();
 
-for (const [category, variants] of Object.entries(queryVariants)) {
-  for (let i = 0; i < 25; i += 1) {
+const groupEntries = Object.entries(queryVariants);
+const casesPerGroup = Math.ceil(QUERY_CASES / groupEntries.length);
+
+for (const [category, variants] of groupEntries) {
+  for (let i = 0; i < casesPerGroup; i += 1) {
+    if (timings.length >= QUERY_CASES) break;
     const [query, expectedKey] = variants[i % variants.length];
     const params = {
       query,
@@ -327,7 +339,12 @@ for (const [category, variants] of Object.entries(queryVariants)) {
 }
 
 const totalMs = performance.now() - started;
-const expectedCases = 12 * 25 + 10 * 25;
+const expectedShapeCases = groupEntries.reduce((sum, [category], index) => {
+  const start = index * casesPerGroup;
+  const count = Math.max(0, Math.min(casesPerGroup, QUERY_CASES - start));
+  return category === "no-result" || category === "filtering" ? sum : sum + count;
+}, 0);
+const expectedCases = QUERY_CASES + expectedShapeCases;
 if (cases.length !== expectedCases) {
   throw new Error(`expected ${expectedCases} assertions, got ${cases.length}`);
 }
@@ -344,7 +361,7 @@ console.log(
     {
       ok: true,
       workRoot,
-      queryCases: 300,
+      queryCases: QUERY_CASES,
       assertions: cases.length,
       byCategory,
       performance: {

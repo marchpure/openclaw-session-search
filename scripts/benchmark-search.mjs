@@ -23,8 +23,9 @@ const scales = process.argv
   .flatMap((arg) => arg.slice("--scale=".length).split(","))
   .map((value) => Number(value))
   .filter((value) => Number.isFinite(value) && value > 0);
-const SCALE_SET = scales.length ? scales : [1000, 5000, 10000];
+const SCALE_SET = scales.length ? scales : [1000, 5000, 10000, 30000];
 const LARGE_FILES = intArg("large-files", 30);
+const maxScale = Math.max(...SCALE_SET);
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -133,8 +134,8 @@ async function loadMethods() {
       backend: "rg",
       fallbackToNode: true,
       defaultLimit: 20,
-      maxSessions: 10000,
-      maxFiles: 10000,
+      maxSessions: maxScale,
+      maxFiles: maxScale,
       timeoutMs: 10000,
     },
     registerGatewayMethod(name, handler) {

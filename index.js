@@ -44,7 +44,7 @@ function resolveConfig(raw) {
     fallbackToNode:
       typeof cfg.fallbackToNode === "boolean" ? cfg.fallbackToNode : DEFAULTS.fallbackToNode,
     defaultLimit: clampInt(cfg.defaultLimit, DEFAULTS.defaultLimit, 1, 50),
-    maxSessions: clampInt(cfg.maxSessions, DEFAULTS.maxSessions, 1, 10000),
+    maxSessions: clampInt(cfg.maxSessions, DEFAULTS.maxSessions, 1, 50000),
     maxCharsPerMessage: clampInt(
       cfg.maxCharsPerMessage,
       DEFAULTS.maxCharsPerMessage,
@@ -57,7 +57,7 @@ function resolveConfig(raw) {
       4096,
       2 * 1024 * 1024,
     ),
-    maxFiles: clampInt(cfg.maxFiles, DEFAULTS.maxFiles, 1, 10000),
+    maxFiles: clampInt(cfg.maxFiles, DEFAULTS.maxFiles, 1, 50000),
     sinceDays: clampInt(cfg.sinceDays, DEFAULTS.sinceDays, 0, 3650),
     timeoutMs: clampInt(cfg.timeoutMs, DEFAULTS.timeoutMs, 100, 60000),
     rgBatchSize: clampInt(cfg.rgBatchSize, DEFAULTS.rgBatchSize, 1, 500),
@@ -1155,7 +1155,7 @@ async function sessionSearch(params, cfg) {
   if (!query) throw new Error("query is required");
   const agentId = normalizeAgentId(params.agentId);
   const limit = clampInt(params.limit, cfg.defaultLimit, 1, 50);
-  const maxSessions = clampInt(params.maxSessions, cfg.maxSessions, 1, 10000);
+  const maxSessions = clampInt(params.maxSessions, cfg.maxSessions, 1, 50000);
   const maxChars = clampInt(params.maxChars, cfg.maxCharsPerMessage, 80, 4000);
   const maxTranscriptBytes = clampInt(
     params.maxTranscriptBytes,
@@ -1163,7 +1163,7 @@ async function sessionSearch(params, cfg) {
     4096,
     2 * 1024 * 1024,
   );
-  const maxFiles = clampInt(params.maxFiles, cfg.maxFiles, 1, 10000);
+  const maxFiles = clampInt(params.maxFiles, cfg.maxFiles, 1, 50000);
   const sinceDays = clampInt(params.sinceDays, cfg.sinceDays, 0, 3650);
   const timeoutMs = clampInt(params.timeoutMs, cfg.timeoutMs, 100, 60000);
   const rgBatchSize = clampInt(params.rgBatchSize, cfg.rgBatchSize, 1, 500);
