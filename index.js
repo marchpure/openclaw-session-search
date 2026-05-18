@@ -839,6 +839,33 @@ function formatSearchTimestamp(value) {
   ].join(" ");
 }
 
+function groupHitsBySession(hits) {
+  const groups = [];
+  const byKey = new Map();
+  for (const hit of hits) {
+    const key = hit.key || hit.sessionId || "unknown";
+    let group = byKey.get(key);
+    if (!group) {
+      group = {
+        key,
+        label: hit.label,
+        sessionId: hit.sessionId,
+        updatedAt: hit.updatedAt,
+        createdAt: hit.createdAt,
+        lastMessageAt: hit.lastMessageAt,
+        hitCount: 0,
+        bestHit: hit,
+        hits: [],
+      };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.hitCount += 1;
+    if (group.hits.length < 3) group.hits.push(hit);
+  }
+  return groups;
+}
+
 function searchWithNode(sessions, terms, opts) {
   return {
     hits: sessions.flatMap((session) =>
@@ -1211,7 +1238,7 @@ async function sessionSearch(params, cfg) {
   const metadataHits = selectedSessions
     .map((session) => searchSessionMetadata(session, terms, searchOpts))
     .filter(Boolean);
-  const results = search.hits
+  const sortedHits = search.hits
     .concat(metadataHits)
     .sort(
       (a, b) =>
@@ -1219,8 +1246,9 @@ async function sessionSearch(params, cfg) {
         b.score - a.score ||
         Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
           Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
-    )
-    .slice(0, limit);
+    );
+  const results = sortedHits.slice(0, limit);
+  const sessionGroups = groupHitsBySession(sortedHits).slice(0, limit);
   return {
     query,
     agentId,
@@ -1241,6 +1269,8 @@ async function sessionSearch(params, cfg) {
     tookMs: Date.now() - startedAt,
     count: results.length,
     results,
+    sessionGroupCount: sessionGroups.length,
+    sessionGroups,
     debug: {
       ...search.meta,
       stderr: search.meta.stderr || undefined,

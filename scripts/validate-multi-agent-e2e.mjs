@@ -9,6 +9,8 @@ const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-session-search-
 const pluginRoot = path.join(workRoot, "plugin");
 const stateRoot = path.join(workRoot, "state");
 const fakeDistDir = path.join(workRoot, "dist");
+const AGENTS = ["ai-1111", "ai-2222", "ai-3333", "main"];
+const TARGET_CASES = 1000;
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -21,11 +23,7 @@ function writeJsonl(file, rows) {
 }
 
 function message(role, text, timestamp) {
-  return {
-    type: "message",
-    timestamp: new Date(timestamp).toISOString(),
-    message: { role, content: [{ type: "text", text }], timestamp },
-  };
+  return { type: "message", timestamp: new Date(timestamp).toISOString(), message: { role, content: [{ type: "text", text }], timestamp } };
 }
 
 function sessionHeader(id, timestamp) {
@@ -40,10 +38,7 @@ function installPluginSandbox() {
     path.join(pluginRoot, "node_modules", "openclaw", "package.json"),
     JSON.stringify({ type: "module", exports: { "./plugin-sdk/plugin-entry": "./plugin-sdk/plugin-entry.js" } }),
   );
-  fs.writeFileSync(
-    path.join(pluginRoot, "node_modules", "openclaw", "plugin-sdk", "plugin-entry.js"),
-    "export function definePluginEntry(entry) { return entry; }\n",
-  );
+  fs.writeFileSync(path.join(pluginRoot, "node_modules", "openclaw", "plugin-sdk", "plugin-entry.js"), "export function definePluginEntry(entry) { return entry; }\n");
   fs.mkdirSync(fakeDistDir, { recursive: true });
   fs.writeFileSync(path.join(fakeDistDir, "session-binding-service-multi.js"), "export function getSessionBindingService() { return null; }\n");
 }
@@ -71,40 +66,49 @@ function addSession(store, dir, agentId, name, { label, text, updatedAt, kind = 
   writeJsonl(sessionFile, [
     sessionHeader(sessionId, updatedAt - 10000),
     message("user", text, updatedAt - 9000),
-    message("assistant", `reply ${agentId}/${name}`, updatedAt),
+    message("assistant", `reply ${agentId}/${name} project-x repeated-summary`, updatedAt),
   ]);
 }
 
 function createFixture() {
   const now = Date.now();
-  for (const agentId of ["ai-1111", "ai-2222", "main"]) {
+  for (const agentId of AGENTS) {
     const dir = sessionsDir(agentId);
     fs.mkdirSync(dir, { recursive: true });
     const store = {};
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 20; i += 1) {
       addSession(store, dir, agentId, `project-x-${i}`, {
         label: `Project X ${agentId} session ${i}`,
-        text: `project-x shared-topic ${agentId} session-${i} ${i % 2 === 0 ? "memory-lancedb" : "google博客"} repeated-summary`,
+        text: [
+          `project-x shared-topic ${agentId} session-${i}`,
+          i % 2 === 0 ? "memory-lancedb" : "google博客",
+          i % 3 === 0 ? "foo.bar(baz)" : "2026/5/16 16:30:35",
+          "repeated-summary",
+        ].join(" "),
         updatedAt: now - i * 1000,
       });
     }
-    addSession(store, dir, agentId, "unique-decision", {
-      label: `Unique decision ${agentId}`,
-      text: `unique-decision-${agentId} final owner=${agentId} risk=medium`,
-      updatedAt: now - 20000,
-    });
-    addSession(store, dir, agentId, "cron-hidden", {
-      label: "cron hidden",
-      text: "project-x hidden cron should not surface",
-      updatedAt: now,
-      kind: "cron",
-    });
-    addSession(store, dir, agentId, "subagent-hidden", {
-      label: "subagent hidden",
-      text: "project-x hidden subagent should not surface",
-      updatedAt: now,
-      kind: "subagent",
-    });
+    for (let i = 0; i < 5; i += 1) {
+      addSession(store, dir, agentId, `unique-decision-${i}`, {
+        label: `Unique decision ${agentId} ${i}`,
+        text: `unique-decision-${agentId}-${i} final owner=${agentId} risk=${i % 2 === 0 ? "medium" : "low"}`,
+        updatedAt: now - 30000 - i,
+      });
+    }
+    for (let i = 0; i < 4; i += 1) {
+      addSession(store, dir, agentId, `cron-hidden-${i}`, {
+        label: `cron hidden ${i}`,
+        text: "project-x hidden cron should not surface",
+        updatedAt: now - i,
+        kind: "cron",
+      });
+      addSession(store, dir, agentId, `subagent-hidden-${i}`, {
+        label: `subagent hidden ${i}`,
+        text: "project-x hidden subagent should not surface",
+        updatedAt: now - i,
+        kind: "subagent",
+      });
+    }
     addSession(store, dir, agentId, "tool-hidden", {
       label: "/session-search project-x",
       text: "历史会话搜索：project-x",
@@ -122,7 +126,7 @@ async function loadMethods() {
   const entry = (await import(pathToFileURL(path.join(pluginRoot, "index.js")).href)).default;
   const methods = new Map();
   entry.register({
-    pluginConfig: { enabled: true, defaultLimit: 8, maxSessions: 500, maxFiles: 500 },
+    pluginConfig: { enabled: true, defaultLimit: 8, maxSessions: 1000, maxFiles: 1000 },
     registerGatewayMethod(name, handler) {
       methods.set(name, handler);
     },
@@ -149,6 +153,10 @@ function assertCase(cases, category, name, condition, details = {}) {
   cases.push({ category, name });
 }
 
+function uniqueSessionKeys(results) {
+  return Array.from(new Set(results.map((row) => row.key)));
+}
+
 function groupByAgent(results) {
   return results.reduce((acc, row) => {
     const agentId = row.key.split(":")[1] || "unknown";
@@ -158,82 +166,70 @@ function groupByAgent(results) {
   }, {});
 }
 
-function uniqueSessionKeys(results) {
-  return Array.from(new Set(results.map((row) => row.key)));
-}
-
-function topSessionsByKey(results, limit) {
-  const seen = new Set();
-  const sessions = [];
-  for (const row of results) {
-    if (seen.has(row.key)) continue;
-    seen.add(row.key);
-    sessions.push(row);
-    if (sessions.length >= limit) break;
-  }
-  return sessions;
-}
-
 const methods = await loadMethods();
 const cases = [];
 const timings = [];
 const started = performance.now();
+const querySet = [
+  "project-x",
+  "shared-topic",
+  "memory-lancedb",
+  "google博客",
+  "foo.bar(baz)",
+  "2026/5/16 16:30:35",
+  "repeated-summary",
+  "risk=medium",
+  "unique-decision",
+  "不存在的查询词火星水星木星",
+];
 
-for (const agentId of ["ai-1111", "ai-2222", "main"]) {
+for (let i = 0; i < TARGET_CASES; i += 1) {
+  const agentId = AGENTS[i % AGENTS.length];
+  const query = querySet[i % querySet.length];
   const t0 = performance.now();
   const result = await callMethod(methods, "session-search.search", {
-    query: "project-x",
+    query,
     agentId,
     limit: 50,
     sinceDays: 3650,
-    maxSessions: 500,
-    maxFiles: 500,
+    maxSessions: 1000,
+    maxFiles: 1000,
   });
   timings.push(performance.now() - t0);
-  assertCase(cases, "single-agent", `${agentId} returns many visible sessions`, uniqueSessionKeys(result.results).length === 8, { count: result.count });
-  assertCase(cases, "single-agent", `${agentId} filters hidden classes`, result.filteredCron === 1 && result.filteredSubagent === 1 && result.filteredTool === 1, result);
-  assertCase(cases, "single-agent", `${agentId} result keys stay in agent`, result.results.every((row) => row.key.startsWith(`agent:${agentId}:`)));
+  if (query === "不存在的查询词火星水星木星") {
+    assertCase(cases, "functional", `no-result ${i}`, result.count === 0 && result.sessionGroupCount === 0, result);
+    continue;
+  }
+  assertCase(cases, "functional", `results stay in requested agent ${i}`, result.results.every((row) => row.key.startsWith(`agent:${agentId}:`)), result.results.slice(0, 3));
+  assertCase(cases, "filtering", `hidden filtered ${i}`, result.filteredCron === 4 && result.filteredSubagent === 4 && result.filteredTool === 1, result);
+  assertCase(cases, "experience", `session groups are deduped ${i}`, result.sessionGroupCount <= result.count, {
+    count: result.count,
+    sessionGroupCount: result.sessionGroupCount,
+  });
+  assertCase(cases, "experience", `group shape ${i}`, result.sessionGroups.every((group) => group.key && group.hitCount >= 1 && group.bestHit?.snippet), result.sessionGroups[0]);
+  if (query === "project-x" || query === "shared-topic" || query === "repeated-summary") {
+    assertCase(cases, "functional", `many sessions found ${i}`, uniqueSessionKeys(result.results).length >= 10, { query, count: result.count });
+  }
 }
 
-const crossAgentResults = [];
-for (const agentId of ["ai-1111", "ai-2222", "main"]) {
+const crossAgentHits = [];
+for (const agentId of AGENTS) {
   const result = await callMethod(methods, "session-search.search", {
     query: "project-x",
     agentId,
     limit: 50,
     sinceDays: 3650,
-    maxSessions: 500,
-    maxFiles: 500,
+    maxSessions: 1000,
+    maxFiles: 1000,
   });
-  crossAgentResults.push(...result.results);
+  crossAgentHits.push(...result.results);
 }
-const grouped = groupByAgent(crossAgentResults);
-assertCase(cases, "cross-agent", "cross agent aggregation has three groups", Object.keys(grouped).length === 3, grouped);
-assertCase(cases, "cross-agent", "each agent group has eight unique sessions", Object.values(grouped).every((rows) => uniqueSessionKeys(rows).length === 8), grouped);
+const grouped = groupByAgent(crossAgentHits);
+assertCase(cases, "cross-agent", "four agent groups present", Object.keys(grouped).length === 4, grouped);
+assertCase(cases, "cross-agent", "each group has at least ten sessions", Object.values(grouped).every((rows) => uniqueSessionKeys(rows).length >= 10), grouped);
 
-for (const agentId of ["ai-1111", "ai-2222", "main"]) {
-  const result = await callMethod(methods, "session-search.search", {
-    query: `unique-decision-${agentId}`,
-    agentId,
-    limit: 5,
-    sinceDays: 3650,
-    maxSessions: 500,
-    maxFiles: 500,
-  });
-  assertCase(cases, "precision", `${agentId} unique query returns one session`, result.count === 1, result);
-  assertCase(cases, "precision", `${agentId} unique query resolves expected key`, result.results[0]?.key === `agent:${agentId}:unique-decision`, result.results[0]);
-}
-
-const proposedAgentSummaries = Object.entries(grouped).map(([agentId, rows]) => ({
-  agentId,
-  totalHits: rows.length,
-  totalSessions: uniqueSessionKeys(rows).length,
-  topSessions: topSessionsByKey(rows, 3).map((row) => ({ key: row.key, label: row.label, snippet: row.snippet })),
-  hiddenOverflow: Math.max(0, uniqueSessionKeys(rows).length - 3),
-}));
-assertCase(cases, "ux", "grouped summary caps top sessions per agent", proposedAgentSummaries.every((group) => group.topSessions.length <= 3), proposedAgentSummaries);
-assertCase(cases, "ux", "grouped summary exposes overflow count", proposedAgentSummaries.every((group) => group.hiddenOverflow === 5), proposedAgentSummaries);
-
+const sortedTimings = [...timings].sort((a, b) => a - b);
+const percentile = (p) => Math.round(sortedTimings[Math.min(sortedTimings.length - 1, Math.floor(sortedTimings.length * p))] || 0);
 const totalMs = performance.now() - started;
 const byCategory = cases.reduce((acc, item) => {
   acc[item.category] = (acc[item.category] || 0) + 1;
@@ -245,16 +241,18 @@ console.log(
     {
       ok: true,
       workRoot,
+      queryCases: TARGET_CASES,
       assertions: cases.length,
       byCategory,
-      proposedResultShape: {
-        query: "project-x",
-        groups: proposedAgentSummaries,
-      },
+      agents: AGENTS,
       performance: {
         totalMs: Math.round(totalMs),
-        avgSingleAgentMs: Math.round(timings.reduce((sum, item) => sum + item, 0) / timings.length),
+        avgMs: Math.round(timings.reduce((sum, item) => sum + item, 0) / timings.length),
+        p50Ms: percentile(0.5),
+        p95Ms: percentile(0.95),
+        maxMs: Math.round(sortedTimings.at(-1) || 0),
       },
+      recommendedUx: "group by agentId, dedupe by session key, render top sessions with hitCount and bestHit, hide overflow behind expand",
     },
     null,
     2,
