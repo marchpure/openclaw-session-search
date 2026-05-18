@@ -354,6 +354,44 @@ function tokenize(text) {
     .filter((item) => item.length >= 2);
 }
 
+function parseTimeQuery(query) {
+  const text = String(query ?? "").trim();
+  const match = text.match(
+    /^(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})日?(?:[ T]+(\d{1,2})(?::(\d{1,2}))?(?::(\d{1,2}))?)?$/,
+  );
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = match[4] === undefined ? 0 : Number(match[4]);
+  const minute = match[5] === undefined ? 0 : Number(match[5]);
+  const second = match[6] === undefined ? 0 : Number(match[6]);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    return null;
+  }
+  const hasTime = match[4] !== undefined;
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (day > daysInMonth) return null;
+  const target = Date.UTC(year, month - 1, day, hour - 8, minute, second);
+  return {
+    target,
+    hasTime,
+    start: hasTime ? Number.NEGATIVE_INFINITY : target,
+    end: hasTime ? Number.POSITIVE_INFINITY : target + 24 * 60 * 60 * 1000,
+  };
+}
+
 function scoreText(text, terms) {
   const lower = text.toLowerCase();
   let score = 0;
@@ -487,6 +525,45 @@ function searchTranscriptNode(session, terms, opts) {
       line: i + 1,
       timestamp: msg.timestamp,
       snippet: snippet(msg.text, terms, opts.maxChars),
+    });
+  }
+  return hits;
+}
+
+function searchTranscriptByTimeNode(session, timeQuery, opts) {
+  if (!session.sessionFile || !fs.existsSync(session.sessionFile)) return [];
+  const stat = fs.statSync(session.sessionFile);
+  const fd = fs.openSync(session.sessionFile, "r");
+  const readBytes = Math.min(stat.size, opts.maxTranscriptBytes);
+  const buffer = Buffer.alloc(readBytes);
+  fs.readSync(fd, buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
+  fs.closeSync(fd);
+  const lines = buffer.toString("utf8").split(/\r?\n/);
+  const hits = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const msg = parseTranscriptLine(lines[i]);
+    if (!msg) continue;
+    if (!SEARCHABLE_ROLES.has(msg.role)) continue;
+    if (!opts.includeAssistant && msg.role === "assistant") continue;
+    if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
+    if (!Number.isFinite(Number(msg.timestamp))) continue;
+    const timestamp = Number(msg.timestamp);
+    if (timestamp < timeQuery.start || timestamp >= timeQuery.end) continue;
+    const distanceMs = Math.abs(timestamp - timeQuery.target);
+    hits.push({
+      score: -distanceMs,
+      distanceMs,
+      key: session.key,
+      label: session.label,
+      sessionId: session.sessionId,
+      updatedAt: session.updatedAt,
+      createdAt: session.createdAt,
+      lastMessageAt: session.lastMessageAt,
+      role: msg.role,
+      line: i + 1,
+      timestamp,
+      snippet: snippet(msg.text, [], opts.maxChars),
     });
   }
   return hits;
@@ -646,6 +723,20 @@ function searchWithNode(sessions, terms, opts) {
       }),
     ),
     meta: { backend: "node" },
+  };
+}
+
+function searchWithTimeNode(sessions, timeQuery, opts) {
+  return {
+    hits: sessions.flatMap((session) =>
+      searchTranscriptByTimeNode(session, timeQuery, {
+        includeAssistant: opts.includeAssistant,
+        excludePluginOutputs: opts.excludePluginOutputs,
+        maxChars: opts.maxChars,
+        maxTranscriptBytes: opts.maxTranscriptBytes,
+      }),
+    ),
+    meta: { backend: "time" },
   };
 }
 
@@ -972,8 +1063,9 @@ async function sessionSearch(params, cfg) {
     typeof params.includeAssistant === "boolean"
       ? params.includeAssistant
       : cfg.includeAssistantByDefault;
+  const timeQuery = parseTimeQuery(query);
   const terms = Array.from(new Set(tokenize(query)));
-  if (terms.length === 0) throw new Error("query has no searchable terms");
+  if (!timeQuery && terms.length === 0) throw new Error("query has no searchable terms");
   const listed = listSessionEntries(agentId, {
     maxSessions,
     sinceDays,
@@ -996,20 +1088,28 @@ async function sessionSearch(params, cfg) {
     rgBatchSize,
     excludePluginOutputs: cfg.excludePluginOutputs,
   };
-  let search =
-    cfg.backend === "rg"
-      ? await searchWithRg(selectedSessions, terms, searchOpts)
-      : searchWithNode(selectedSessions, terms, searchOpts);
-  if (search.meta.failed && cfg.fallbackToNode) {
-    search = searchWithNode(selectedSessions, terms, searchOpts);
-    search.meta.fallbackFrom = "rg";
+  let search;
+  if (timeQuery) {
+    search = searchWithTimeNode(selectedSessions, timeQuery, searchOpts);
+  } else {
+    search =
+      cfg.backend === "rg"
+        ? await searchWithRg(selectedSessions, terms, searchOpts)
+        : searchWithNode(selectedSessions, terms, searchOpts);
+    if (search.meta.failed && cfg.fallbackToNode) {
+      search = searchWithNode(selectedSessions, terms, searchOpts);
+      search.meta.fallbackFrom = "rg";
+    }
   }
   const results = search.hits
     .sort(
       (a, b) =>
-        b.score - a.score ||
-        Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
-          Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
+        timeQuery
+          ? Number(a.distanceMs ?? Number.POSITIVE_INFINITY) -
+              Number(b.distanceMs ?? Number.POSITIVE_INFINITY)
+          : b.score - a.score ||
+              Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
+                Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
     )
     .slice(0, limit);
   return {
@@ -1034,6 +1134,13 @@ async function sessionSearch(params, cfg) {
     results,
     debug: {
       ...search.meta,
+      timeQuery: timeQuery
+        ? {
+            target: timeQuery.target,
+            targetText: formatTime(timeQuery.target),
+            hasTime: timeQuery.hasTime,
+          }
+        : undefined,
       stderr: search.meta.stderr || undefined,
     },
   };
