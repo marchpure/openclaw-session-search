@@ -180,18 +180,7 @@ install_plugin() {
 }
 
 configure_plugin() {
-  openclaw config patch --stdin <<'JSON'
-{
-  "plugins": {
-    "entries": {
-      "session-search": {
-        "enabled": true
-      }
-    }
-  }
-}
-JSON
-
+  openclaw plugins enable "$PLUGIN_ID" || true
   remove_legacy_config_enabled
 }
 
@@ -254,7 +243,6 @@ main() {
   log "OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR_RESOLVED"
   remove_legacy_config_enabled
   install_plugin
-  openclaw plugins enable "$PLUGIN_ID" || true
   configure_plugin
 
   log "patching openclaw-lark conversation binding support"
