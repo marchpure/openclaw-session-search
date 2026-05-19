@@ -33,7 +33,7 @@ Optional flags can include hidden classes for operator diagnostics:
 ## One-command Install
 
 ```bash
-curl -fsSL https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/install.sh | bash
+curl -fsSL https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/install-v2.sh | bash
 ```
 
 The installer downloads the plugin package, installs and enables the plugin, and patches the installed `openclaw-lark` Feishu channel with:
