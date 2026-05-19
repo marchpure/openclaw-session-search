@@ -207,7 +207,7 @@ function assertCase(cases, category, name, condition, details = {}) {
 const queryVariants = {
   title: [
     ["Resume Test Alpha Project", "agent:main:title-alpha"],
-    ["resume test alpha", "agent:main:title-alpha"],
+    ["session test alpha", "agent:main:title-alpha"],
     ["TITLE-ALPHA", "agent:main:title-alpha"],
     ["title-alpha", "agent:main:title-alpha"],
     ["agent:main:title-alpha", "agent:main:title-alpha"],

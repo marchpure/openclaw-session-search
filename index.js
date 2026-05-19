@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const DEFAULTS = {
@@ -124,7 +123,7 @@ function stringFromEntry(entry, key) {
 
 function isPluginCommandSession(entry) {
   const label = stringFromEntry(entry, "label");
-  return /^\/(?:session-search|resume)(?:\s|$)/i.test(label);
+  return /^\/session-search(?:\s|$)/i.test(label);
 }
 
 function hasUserVisibleChannel(entry) {
@@ -257,13 +256,6 @@ function listLegacyTranscriptEntries(dir, indexedSessionIds) {
     });
 }
 
-function parseAgentIdFromSessionKey(key) {
-  const parts = String(key ?? "").split(":");
-  const agentIndex = parts.indexOf("agent");
-  if (agentIndex >= 0 && parts[agentIndex + 1]) return parts[agentIndex + 1];
-  return "main";
-}
-
 function resolveSessionFile(dir, entry) {
   const raw = typeof entry.sessionFile === "string" ? entry.sessionFile.trim() : "";
   if (raw) return path.isAbsolute(raw) ? raw : path.resolve(dir, raw);
@@ -344,57 +336,6 @@ function readTranscriptSummary(sessionFile, maxChars = 96) {
     return empty;
   }
   return empty;
-}
-
-function normalizeSessionLabel(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function parseSessionResumeLabel(raw) {
-  const label = normalizeSessionLabel(raw);
-  if (!label) return { ok: false, error: "请提供要恢复的命名会话。" };
-  if (label.length > 120) return { ok: false, error: "会话名过长，最多 120 个字符。" };
-  if (/[\r\n\t]/.test(label)) return { ok: false, error: "会话名不能包含换行或制表符。" };
-  return { ok: true, label };
-}
-
-function sessionDisplayName(session) {
-  return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
-}
-
-function listResumableSessions(agentId, cfg, params = {}) {
-  const listed = listSessionEntries(agentId, {
-    maxSessions: clampInt(params.maxSessions, 100, 1, cfg.maxSessions),
-    sinceDays: clampInt(params.sinceDays, 3650, 0, 3650),
-    includeCron: false,
-    includeSubagents: false,
-    includeInternal: false,
-  });
-  const sessions = listed.sessions.map((session) => ({
-    ...session,
-    label: normalizeSessionLabel(session.label),
-    displayName: sessionDisplayName(session),
-    ...readTranscriptSummary(session.sessionFile),
-  }));
-  return { sessions, stats: listed.stats };
-}
-
-function resolveResumableSession(agentId, target, cfg) {
-  const { sessions } = listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions });
-  const exact = sessions.filter((session) => session.label === target || session.key === target);
-  if (exact.length === 1) return { ok: true, session: exact[0] };
-  if (exact.length > 1) {
-    return { ok: false, code: "ambiguous", matches: exact };
-  }
-  const targetLower = target.toLowerCase();
-  const insensitive = sessions.filter(
-    (session) => session.label.toLowerCase() === targetLower || session.key.toLowerCase() === targetLower,
-  );
-  if (insensitive.length === 1) return { ok: true, session: insensitive[0] };
-  if (insensitive.length > 1) {
-    return { ok: false, code: "ambiguous", matches: insensitive };
-  }
-  return { ok: false, code: "not_found", matches: [] };
 }
 
 function splitScriptRuns(text) {
@@ -496,15 +437,9 @@ function isPluginGeneratedTranscriptText(text) {
   const normalized = cleanTranscriptText(text);
   if (!normalized) return false;
   if (/^历史会话搜索：/.test(normalized)) return true;
-  if (/^可恢复会话：/.test(normalized)) return true;
-  if (/^已恢复会话：/.test(normalized)) return true;
-  if (/^恢复会话失败：/.test(normalized)) return true;
   if (/^Session search is disabled\./.test(normalized)) return true;
-  if (/^Session resume is disabled\./.test(normalized)) return true;
-  if (/结果 \d+ 条 \| 可见会话 \d+ 个 \| 过滤 \d+ 个 \| \d+ms \((?:rg|node)\)/.test(normalized)) return true;
+  if (/结果 \d+ 个会话 \| 命中 \d+ 次 \| 可见会话 \d+ 个 \| 过滤 \d+ 个 \| \d+ms \((?:rg|node)\)/.test(normalized)) return true;
   if (normalized.includes("未找到匹配的用户可见会话。")) return true;
-  if (normalized.includes("使用：/resume <会话或恢复ID>")) return true;
-  if (normalized.includes("后续消息会继续进入这个会话。")) return true;
   return false;
 }
 
@@ -526,7 +461,6 @@ function cleanTranscriptText(value) {
   let text = String(value ?? "");
   const metadataMarkers = [
     "\n\n你好",
-    "\n\n/resume",
     "\n\n/session-search",
     "\n\n/status",
   ];
@@ -839,7 +773,15 @@ function formatSearchTimestamp(value) {
   ].join(" ");
 }
 
-function groupHitsBySession(hits) {
+function normalizeSessionLabel(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function sessionDisplayName(session) {
+  return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
+}
+
+function groupHitsBySession(hits, maxHitsPerSession = 2) {
   const groups = [];
   const byKey = new Map();
   for (const hit of hits) {
@@ -861,7 +803,7 @@ function groupHitsBySession(hits) {
       groups.push(group);
     }
     group.hitCount += 1;
-    if (group.hits.length < 3) group.hits.push(hit);
+    if (group.hits.length < maxHitsPerSession) group.hits.push(hit);
   }
   return groups;
 }
@@ -908,233 +850,6 @@ function roleLabel(role) {
   return role || "未知";
 }
 
-function stripKnownChannelPrefix(channel, value) {
-  const text = typeof value === "string" ? value.trim() : "";
-  if (!text) return "";
-  const prefix = `${String(channel ?? "").trim().toLowerCase()}:`;
-  return prefix && text.toLowerCase().startsWith(prefix) ? text.slice(prefix.length) : text;
-}
-
-function resolveCommandConversation(ctx) {
-  const channel = String(ctx.channel ?? ctx.channelId ?? "").trim().toLowerCase();
-  if (!channel) return null;
-  const accountId = String(ctx.accountId ?? "default").trim() || "default";
-  const rawConversation =
-    typeof ctx.to === "string" && ctx.to.trim()
-      ? ctx.to
-      : typeof ctx.from === "string" && ctx.from.trim()
-        ? ctx.from
-        : typeof ctx.senderId === "string" && ctx.senderId.trim()
-          ? `user:${ctx.senderId.trim()}`
-          : "";
-  const conversationId = stripKnownChannelPrefix(channel, rawConversation);
-  if (!conversationId) return null;
-  const parentConversationId =
-    typeof ctx.threadParentId === "string" && ctx.threadParentId.trim()
-      ? stripKnownChannelPrefix(channel, ctx.threadParentId)
-      : undefined;
-  return {
-    channel,
-    accountId,
-    conversationId:
-      typeof ctx.messageThreadId === "string" || typeof ctx.messageThreadId === "number"
-        ? String(ctx.messageThreadId)
-        : conversationId,
-    ...(parentConversationId ? { parentConversationId } : {}),
-  };
-}
-
-function resolveOpenClawDistDir() {
-  const candidates = [
-    process.env.OPENCLAW_DIST_DIR,
-    "/usr/lib/node_modules/openclaw/dist",
-    path.join(process.cwd(), "dist"),
-  ].filter(Boolean);
-  return candidates.find((candidate) => {
-    try {
-      return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory();
-    } catch {
-      return false;
-    }
-  });
-}
-
-async function importOpenClawInternalChunk(prefix) {
-  const distDir = resolveOpenClawDistDir();
-  if (!distDir) return null;
-  const direct = path.join(distDir, `${prefix}.js`);
-  const file = fs.existsSync(direct)
-    ? direct
-    : fs.readdirSync(distDir).find((name) => name.startsWith(`${prefix}-`) && name.endsWith(".js"));
-  if (!file) return null;
-  const filePath = path.isAbsolute(file) ? file : path.join(distDir, file);
-  return import(pathToFileURL(filePath).href);
-}
-
-async function getCoreSessionBindingService() {
-  const mod = await importOpenClawInternalChunk("session-binding-service");
-  const getter = mod?.getSessionBindingService ?? mod?.r;
-  return typeof getter === "function" ? getter() : null;
-}
-
-function formatNamedSessionsReply(sessions, stats) {
-  if (!sessions.length) {
-    return "可恢复会话：0 个\n\n没有找到用户可见会话。";
-  }
-  const lines = [
-    `可恢复会话：${sessions.length} 个`,
-    `范围：可见会话 ${stats.visibleSessions} 个`,
-    "",
-  ];
-  sessions.slice(0, 20).forEach((session, index) => {
-    lines.push(`--- ${index + 1}/${Math.min(sessions.length, 20)} ---`);
-    lines.push(`会话：${singleLine(session.displayName || sessionDisplayName(session), 80)}`);
-    if (session.key && session.key !== session.displayName) {
-      lines.push(`恢复ID：${singleLine(session.key, 96)}`);
-    }
-    const created = formatTime(session.createdAt);
-    const last = formatTime(session.lastMessageAt || session.updatedAt);
-    if (created) lines.push(`创建：${created}`);
-    if (last) lines.push(`最近交流：${last}`);
-    if (session.lastMessagePreview) lines.push(`最近：${singleLine(session.lastMessagePreview, 120)}`);
-    lines.push("");
-  });
-  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话或恢复ID。`);
-  lines.push("使用：/resume <会话或恢复ID>");
-  return lines.join("\n");
-}
-
-function formatResumeSuccessReply(session, binding) {
-  return [
-    `已恢复会话：${session.displayName || sessionDisplayName(session)}`,
-    "",
-    `恢复ID：${session.key}`,
-    binding?.bindingId ? `绑定：${binding.bindingId}` : "",
-    "后续消息会继续进入这个会话。",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function sessionResume(params, cfg) {
-  const agentId = normalizeAgentId(params.agentId);
-  const labelRaw = typeof params.label === "string" ? params.label : "";
-  if (!labelRaw.trim()) {
-    return {
-      action: "list",
-      ...listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions }),
-    };
-  }
-  const parsed = parseSessionResumeLabel(labelRaw);
-  if (!parsed.ok) {
-    return { action: "error", code: "invalid_label", message: parsed.error };
-  }
-  const resolved = resolveResumableSession(agentId, parsed.label, cfg);
-  if (!resolved.ok) {
-    return {
-      action: "error",
-      code: resolved.code,
-      message:
-        resolved.code === "ambiguous"
-          ? `可恢复会话不唯一：${parsed.label}`
-          : `找不到可恢复会话：${parsed.label}`,
-      matches: resolved.matches?.map((session) => ({
-        key: session.key,
-        label: session.label,
-        displayName: session.displayName,
-        updatedAt: session.updatedAt,
-      })),
-    };
-  }
-  const conversation = params.conversation ?? null;
-  if (!conversation?.channel || !conversation?.conversationId) {
-    return {
-      action: "error",
-      code: "conversation_unavailable",
-      message: "/resume 必须在可绑定的会话里执行。",
-    };
-  }
-  const service = await getCoreSessionBindingService();
-  if (!service?.bind || !service?.getCapabilities) {
-    return {
-      action: "error",
-      code: "binding_service_unavailable",
-      message: "当前 OpenClaw 运行时没有暴露会话绑定服务。",
-    };
-  }
-  const capabilities = service.getCapabilities({
-    channel: conversation.channel,
-    accountId: conversation.accountId ?? "default",
-  });
-  if (
-    !capabilities?.adapterAvailable ||
-    !capabilities.bindSupported ||
-    !capabilities.placements?.includes("current")
-  ) {
-    return {
-      action: "error",
-      code: "binding_unavailable",
-      message: `当前通道不支持会话绑定：${conversation.channel}:${conversation.accountId ?? "default"}`,
-      capabilities,
-    };
-  }
-  const senderId = typeof params.senderId === "string" ? params.senderId.trim() : "";
-  const existing = service.resolveByConversation?.(conversation);
-  const boundBy = typeof existing?.metadata?.boundBy === "string" ? existing.metadata.boundBy.trim() : "";
-  if (existing && boundBy && boundBy !== "system" && senderId && senderId !== boundBy) {
-    return {
-      action: "error",
-      code: "owned_by_other_sender",
-      message: `当前会话只能由 ${boundBy} 恢复。`,
-    };
-  }
-  try {
-    const targetAgentId = parseAgentIdFromSessionKey(resolved.session.key);
-    const displayName = resolved.session.displayName || sessionDisplayName(resolved.session);
-    const binding = await service.bind({
-      targetSessionKey: resolved.session.key,
-      targetKind: "session",
-      conversation,
-      placement: "current",
-      metadata: {
-        threadName: `OpenClaw ${targetAgentId}/${displayName}`,
-        introText: `Resumed session ${displayName}.`,
-        agentId: targetAgentId,
-        label: displayName,
-        boundBy: senderId || "unknown",
-      },
-    });
-    return {
-      action: "resume",
-      session: resolved.session,
-      binding,
-    };
-  } catch (error) {
-    return {
-      action: "error",
-      code: "bind_failed",
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function formatSessionResumeCommandReply(result) {
-  if (result.action === "list") {
-    return formatNamedSessionsReply(result.sessions, result.stats);
-  }
-  if (result.action === "resume") {
-    return formatResumeSuccessReply(result.session, result.binding);
-  }
-  const lines = [`恢复会话失败：${result.message || result.code || "unknown"}`];
-  if (Array.isArray(result.matches) && result.matches.length > 0) {
-    lines.push("", "候选会话：");
-    result.matches.slice(0, 10).forEach((session, index) => {
-      lines.push(`${index + 1}. ${session.displayName || session.label || session.key}`);
-    });
-  }
-  return lines.join("\n");
-}
-
 function cleanDisplaySnippet(value, query) {
   let text = cleanTranscriptText(value);
   const queryText = String(query ?? "").trim();
@@ -1150,27 +865,39 @@ function cleanDisplaySnippet(value, query) {
 function formatSessionSearchCommandReply(result) {
   const filtered =
     result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal;
+  const sessions = Array.isArray(result.results) ? result.results : [];
+  const hitCount = Number(result.hitCount ?? 0);
   const lines = [
     `历史会话搜索：${result.query}`,
     "",
-    `结果 ${result.count} 条 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
+    `结果 ${sessions.length} 个会话 | 命中 ${hitCount} 次 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
   ];
-  if (!Array.isArray(result.results) || result.results.length === 0) {
+  if (!sessions.length) {
     lines.push("", "未找到匹配的用户可见会话。");
     return lines.join("\n");
   }
   lines.push("");
-  result.results.forEach((item, index) => {
-    const hitTime = formatTime(item.timestamp);
+  sessions.forEach((item, index) => {
     const lastTime = formatTime(item.lastMessageAt || item.updatedAt);
-    const label = item.label || item.key || item.sessionId || "session";
-    lines.push(`--- ${index + 1}/${result.results.length} ---`);
-    lines.push(`会话：${singleLine(label, 56)}`);
-    if (item.key && item.key !== label) lines.push(`恢复ID：${singleLine(item.key, 96)}`);
-    if (hitTime) lines.push(`命中时间：${hitTime}`);
-    if (lastTime && lastTime !== hitTime) lines.push(`最近交流：${lastTime}`);
-    lines.push(`角色：${roleLabel(item.role)}`);
-    lines.push(`片段：${cleanDisplaySnippet(item.snippet, result.query)}`);
+    const displayName = item.displayName || item.label || item.key || item.sessionId || "session";
+    const recentHits = Array.isArray(item.hits) ? item.hits.slice(0, 2) : [];
+    lines.push(`--- ${index + 1}/${sessions.length} ---`);
+    lines.push(`会话：${singleLine(displayName, 56)}`);
+    lines.push(`命中次数：${item.hitCount || recentHits.length}`);
+    if (item.key && item.key !== displayName) lines.push(`会话ID：${singleLine(item.key, 96)}`);
+    if (lastTime) lines.push(`最近交流：${lastTime}`);
+    if (recentHits.length > 0) {
+      lines.push("最近命中：");
+      recentHits.forEach((hit, hitIndex) => {
+        const hitTime = formatTime(hit.timestamp);
+        const hitParts = [
+          hitTime || "未知时间",
+          roleLabel(hit.role),
+          cleanDisplaySnippet(hit.snippet, result.query),
+        ].filter(Boolean);
+        lines.push(`  ${hitIndex + 1}. ${hitParts.join(" | ")}`);
+      });
+    }
     lines.push("");
   });
   return lines.join("\n");
@@ -1267,8 +994,19 @@ async function sessionSearch(params, cfg) {
     sinceDays,
     maxTranscriptBytes,
     tookMs: Date.now() - startedAt,
-    count: results.length,
-    results,
+    count: sessionGroups.length,
+    hitCount: sortedHits.length,
+    results: sessionGroups.map((group) => ({
+      key: group.key,
+      label: group.label,
+      displayName: group.label || group.key || group.sessionId || "session",
+      sessionId: group.sessionId,
+      updatedAt: group.updatedAt,
+      createdAt: group.createdAt,
+      lastMessageAt: group.lastMessageAt,
+      hitCount: group.hitCount,
+      hits: group.hits,
+    })),
     sessionGroupCount: sessionGroups.length,
     sessionGroups,
     debug: {
@@ -1306,30 +1044,7 @@ export default definePluginEntry({
       { scope: "operator.read" },
     );
 
-    api.registerGatewayMethod(
-      "session-search.resume",
-      async ({ params, respond }) => {
-        const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          respond(false, undefined, {
-            code: "disabled",
-            message: "session-search plugin is disabled",
-          });
-          return;
-        }
-        try {
-          respond(true, await sessionResume(asRecord(params), cfg));
-        } catch (error) {
-          respond(false, undefined, {
-            code: "session_resume_failed",
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-      { scope: "operator.write" },
-    );
-
-    api.registerTool(
+  api.registerTool(
       () => {
         const cfg = resolveConfig(api.pluginConfig);
         if (!cfg.enabled) return null;
@@ -1367,10 +1082,6 @@ export default definePluginEntry({
                 type: "boolean",
                 description: "Include subagent sessions. Defaults to false.",
               },
-              includeInternal: {
-                type: "boolean",
-                description: "Include tool/internal sessions. Defaults to false.",
-              },
             },
           },
           async execute(_toolCallId, params) {
@@ -1388,29 +1099,6 @@ export default definePluginEntry({
       },
       { name: "session_search" },
     );
-
-    api.registerCommand({
-      name: "resume",
-      description: "List or resume named OpenClaw sessions",
-      acceptsArgs: true,
-      requireAuth: true,
-      async handler(ctx) {
-        const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          return { text: "Session resume is disabled." };
-        }
-        const result = await sessionResume(
-          {
-            label: typeof ctx.args === "string" ? ctx.args.trim() : "",
-            agentId: "main",
-            conversation: resolveCommandConversation(ctx),
-            senderId: ctx.senderId,
-          },
-          cfg,
-        );
-        return { text: formatSessionResumeCommandReply(result) };
-      },
-    });
 
     api.registerCommand({
       name: "session-search",

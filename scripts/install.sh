@@ -155,25 +155,7 @@ configure_plugin() {
   "plugins": {
     "entries": {
       "session-search": {
-        "enabled": true,
-        "config": {
-          "enabled": true,
-          "backend": "rg",
-          "fallbackToNode": true,
-          "defaultLimit": 8,
-          "maxSessions": 200,
-          "maxCharsPerMessage": 800,
-          "maxTranscriptBytes": 262144,
-          "maxFiles": 1000,
-          "sinceDays": 2,
-          "timeoutMs": 3000,
-          "rgBatchSize": 200,
-          "includeAssistantByDefault": true,
-          "excludePluginOutputs": true,
-          "includeCron": false,
-          "includeSubagents": false,
-          "includeInternal": false
-        }
+        "enabled": true
       }
     }
   }
@@ -249,7 +231,7 @@ main() {
   verify_install
 
   log "done"
-  log "Feishu commands now available: /session-search <keyword>, /resume, /resume <session>"
+  log "Feishu commands now available: /session-search <keyword>"
 }
 
 main "$@"

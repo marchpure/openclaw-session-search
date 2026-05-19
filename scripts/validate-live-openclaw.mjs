@@ -70,20 +70,6 @@ async function timed(label, fn) {
 const cases = [];
 const totalStart = performance.now();
 
-const resumeAllTimed = await timed("resume all", () =>
-  gateway("session-search.resume", { agentId: "main" }),
-);
-const resumeAll = resumeAllTimed.result;
-const sessions = resumeAll.sessions ?? [];
-
-assertCase(cases, "live", "resume returns session list", Array.isArray(sessions));
-assertCase(cases, "live", "resume list shape is stable", sessions.length >= 0, { count: sessions.length });
-assertCase(cases, "filtering", "resume filters subagents by default", resumeAll.stats.filteredSubagent >= 0);
-assertCase(cases, "filtering", "resume filters cron by default", resumeAll.stats.filteredCron >= 0);
-assertCase(cases, "performance", "resume list under 20s", resumeAllTimed.ms < 20000, {
-  ms: Math.round(resumeAllTimed.ms),
-});
-
 const searchHelloTimed = await timed("search hello", () =>
   gateway("session-search.search", {
     query: "你好",
@@ -103,13 +89,15 @@ assertCase(cases, "live", "search result shape is stable", Array.isArray(helloRe
 });
 assertCase(cases, "filtering", "search filters subagents by default", searchHello.filteredSubagent >= 0);
 assertCase(cases, "filtering", "search filters cron by default", searchHello.filteredCron >= 0);
+assertCase(cases, "usability", "search groups hits per session", helloResults.every((row) => Array.isArray(row.hits) && row.hits.length <= 2));
+assertCase(cases, "usability", "search exposes hit counts", helloResults.every((row) => Number(row.hitCount) >= row.hits.length));
 assertCase(cases, "performance", "hello search under 20s", searchHelloTimed.ms < 20000, {
   ms: Math.round(searchHelloTimed.ms),
 });
 
 const queries = [
   "你好",
-  "resume",
+  "session",
   "session",
   "OpenClaw",
   "不存在的查询词_live_validation_zzzz",
@@ -134,75 +122,16 @@ for (const query of queries) {
   });
 }
 
-for (const session of sessions) {
-  assertCase(cases, "display", `session key ${session.key}`, isSessionKey(session.key));
-  assertCase(cases, "display", `session id ${session.key}`, hasText(session.sessionId));
-  assertCase(cases, "display", `session display name ${session.key}`, hasText(session.displayName));
-  assertCase(cases, "display", `session last message ${session.key}`, validTime(session.lastMessageAt));
-  assertCase(cases, "display", `session updated ${session.key}`, validTime(session.updatedAt));
-  assertCase(cases, "usability", `session can be resumed by display or key ${session.key}`, hasText(session.displayName) || isSessionKey(session.key));
-  assertCase(cases, "experience", `preview short enough ${session.key}`, !session.lastMessagePreview || session.lastMessagePreview.length <= 140);
-  assertCase(cases, "experience", `display name no newline ${session.key}`, !/\r|\n/.test(session.displayName));
-  assertCase(cases, "functional", `created before last ${session.key}`, !session.createdAt || session.createdAt <= session.lastMessageAt);
-  assertCase(cases, "functional", `key unique marker ${session.key}`, sessions.filter((row) => row.key === session.key).length === 1);
-}
-
 for (const result of helloResults) {
   assertCase(cases, "display", `search key ${result.key}:${result.line}`, isSessionKey(result.key));
   assertCase(cases, "display", `search session id ${result.key}:${result.line}`, hasText(result.sessionId));
-  assertCase(cases, "display", `search role ${result.key}:${result.line}`, ["user", "assistant", "system"].includes(result.role));
-  assertCase(cases, "display", `search timestamp ${result.key}:${result.line}`, validTime(result.timestamp));
-  assertCase(cases, "display", `search last message ${result.key}:${result.line}`, validTime(result.lastMessageAt));
-  assertCase(cases, "display", `search snippet ${result.key}:${result.line}`, hasText(result.snippet));
-  assertCase(cases, "experience", `search snippet readable ${result.key}:${result.line}`, result.snippet.length <= 260);
-  assertCase(cases, "functional", `search line number ${result.key}:${result.line}`, Number(result.line) > 0);
-  assertCase(cases, "functional", `search timestamp before last ${result.key}:${result.line}`, result.timestamp <= result.lastMessageAt);
-  assertCase(cases, "usability", `search resumable id ${result.key}:${result.line}`, sessions.some((session) => session.key === result.key));
+  assertCase(cases, "display", `search hit count ${result.key}`, Number(result.hitCount) >= result.hits.length);
+  assertCase(cases, "display", `search hit role ${result.key}`, result.hits.every((hit) => ["user", "assistant", "system"].includes(hit.role)));
+  assertCase(cases, "display", `search hit timestamp ${result.key}`, result.hits.every((hit) => validTime(hit.timestamp)));
+  assertCase(cases, "display", `search hit snippet ${result.key}`, result.hits.every((hit) => hasText(hit.snippet)));
+  assertCase(cases, "experience", `search hit snippet readable ${result.key}`, result.hits.every((hit) => hit.snippet.length <= 260));
+  assertCase(cases, "functional", `search grouped session ${result.key}`, Number(result.hits.length) <= 2);
 }
-
-const resumableTargets = [
-  ...sessions.map((session) => session.label).filter(hasText),
-  ...sessions.map((session) => session.key).filter(hasText),
-].slice(0, 6);
-
-for (const [index, target] of resumableTargets.entries()) {
-  const result = await gateway("session-search.resume", {
-    agentId: "main",
-    label: target,
-    conversation: {
-      ...FEISHU_CONVERSATION,
-      conversationId: `${FEISHU_CONVERSATION.conversationId}:live-${index}`,
-    },
-    senderId: FEISHU_SENDER_ID,
-  });
-  const bindingUnavailable = result.code === "binding_unavailable" || result.code === "binding_service_unavailable";
-  assertCase(cases, "functional", `resume target ${target}`, result.action === "resume" || bindingUnavailable, {
-    result,
-  });
-  if (result.action === "resume") {
-    assertCase(cases, "functional", `resume target binding ${target}`, result.binding?.targetSessionKey === result.session?.key);
-    assertCase(cases, "usability", `resume target has label ${target}`, hasText(result.session?.displayName));
-  } else {
-    assertCase(cases, "functional", `resume target binding unavailable ${target}`, bindingUnavailable, { result });
-    assertCase(cases, "usability", `resume target skipped by channel capability ${target}`, bindingUnavailable, { result });
-  }
-}
-
-const missing = await gateway("session-search.resume", {
-  agentId: "main",
-  label: "missing-live-validation-session",
-  conversation: FEISHU_CONVERSATION,
-  senderId: FEISHU_SENDER_ID,
-});
-assertCase(cases, "reliability", "missing resume target returns not_found", missing.code === "not_found");
-
-const invalid = await gateway("session-search.resume", {
-  agentId: "main",
-  label: "bad\nlabel",
-  conversation: FEISHU_CONVERSATION,
-  senderId: FEISHU_SENDER_ID,
-});
-assertCase(cases, "reliability", "invalid resume label rejected", invalid.code === "invalid_label");
 
 for (const limit of [1, 2, 3, 5, 8, 13, 21, 34]) {
   const result = await gateway("session-search.search", {
@@ -215,6 +144,7 @@ for (const limit of [1, 2, 3, 5, 8, 13, 21, 34]) {
   });
   assertCase(cases, "functional", `search limit ${limit}`, result.results.length <= limit);
   assertCase(cases, "usability", `search limit count ${limit}`, result.count === result.results.length);
+  assertCase(cases, "usability", `search limit grouped hits ${limit}`, result.results.every((row) => row.hits.length <= 2));
 }
 
 for (const maxFiles of [1, 2, 3, 5, 8]) {
@@ -311,7 +241,6 @@ console.log(
         filteredCron: searchHello.filteredCron,
       },
       performance: {
-        resumeListMs: Math.round(resumeAllTimed.ms),
         searchHelloMs: Math.round(searchHelloTimed.ms),
         totalMs: Math.round(totalMs),
       },
