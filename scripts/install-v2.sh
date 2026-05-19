@@ -28,110 +28,6 @@ need_cmd() {
   fi
 }
 
-patch_lark_conversation_bindings() {
-  node <<'NODE'
-const fs = require('fs');
-const path = require('path');
-
-const home = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME || '/root', '.openclaw');
-const candidates = [
-  path.join(home, 'extensions', 'openclaw-lark'),
-  path.join(home, 'extensions', 'feishu'),
-  path.join(home, 'extensions', '@larksuite', 'openclaw-lark'),
-  '/usr/lib/node_modules/@larksuite/openclaw-lark',
-].filter((dir, index, all) => all.indexOf(dir) === index);
-
-function read(file) {
-  try {
-    return fs.readFileSync(file, 'utf8');
-  } catch {
-    return null;
-  }
-}
-
-function write(file, text) {
-  fs.writeFileSync(file, text);
-}
-
-function backup(file, original) {
-  const backupPath = `${file}.session-search-backup`;
-  if (!fs.existsSync(backupPath)) {
-    fs.writeFileSync(backupPath, original);
-  }
-}
-
-function patchChannelPlugin(file) {
-  const original = read(file);
-  if (!original) return { touched: false, reason: 'missing' };
-  if (original.includes('supportsCurrentConversationBinding')) {
-    return { touched: false, reason: 'already-present' };
-  }
-
-  const marker = "    // -------------------------------------------------------------------------\n    // Agent prompt";
-  const insertion =
-    "    conversationBindings: {\n" +
-    "        supportsCurrentConversationBinding: true,\n" +
-    "    },\n" +
-    marker;
-
-  if (!original.includes(marker)) {
-    return { touched: false, reason: 'marker-not-found' };
-  }
-
-  backup(file, original);
-  write(file, original.replace(marker, insertion));
-  return { touched: true, reason: 'patched' };
-}
-
-function patchSingleFileIndex(file) {
-  const original = read(file);
-  if (!original) return { touched: false, reason: 'missing' };
-  if (original.includes('supportsCurrentConversationBinding')) {
-    return { touched: false, reason: 'already-present' };
-  }
-
-  const marker = "    register(api) {";
-  const insertion =
-    "    conversationBindings: {\n" +
-    "        supportsCurrentConversationBinding: true,\n" +
-    "    },\n" +
-    marker;
-
-  if (!original.includes(marker)) {
-    return { touched: false, reason: 'marker-not-found' };
-  }
-
-  backup(file, original);
-  write(file, original.replace(marker, insertion));
-  return { touched: true, reason: 'patched-index' };
-}
-
-let found = false;
-const reports = [];
-for (const dir of candidates) {
-  if (!fs.existsSync(dir)) continue;
-  found = true;
-  const channelFile = path.join(dir, 'src', 'channel', 'plugin.js');
-  const indexFile = path.join(dir, 'index.js');
-
-  const channel = patchChannelPlugin(channelFile);
-  reports.push(`${channelFile}: ${channel.reason}`);
-
-  if (channel.reason === 'missing' || channel.reason === 'marker-not-found') {
-    const index = patchSingleFileIndex(indexFile);
-    reports.push(`${indexFile}: ${index.reason}`);
-  }
-}
-
-if (!found) {
-  console.log('openclaw-lark extension not found; skipped conversation binding patch');
-  process.exit(0);
-}
-
-for (const report of reports) console.log(report);
-NODE
-}
-
 remove_legacy_config_enabled() {
   OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR_RESOLVED" node <<'NODE'
 const fs = require('fs');
@@ -240,9 +136,6 @@ main() {
   remove_legacy_config_enabled
   install_plugin
   remove_legacy_config_enabled
-
-  log "patching openclaw-lark conversation binding support"
-  OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR_RESOLVED" patch_lark_conversation_bindings
 
   restart_gateway
   verify_install
