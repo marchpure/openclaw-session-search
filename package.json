@@ -9,7 +9,8 @@
     "index.js",
     "openclaw.plugin.json",
     "README.md",
-    "scripts/install.sh"
+    "scripts/install.sh",
+    "scripts/install-v2.sh"
   ],
   "scripts": {
     "check": "node --check index.js"
