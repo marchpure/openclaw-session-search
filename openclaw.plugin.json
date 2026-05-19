@@ -16,20 +16,10 @@
       "session-search"
     ]
   },
-  "uiHints": {
-    "enabled": {
-      "label": "Enable Session Search",
-      "help": "Expose the session_search tool."
-    }
-  },
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
+    "additionalProperties": true,
     "properties": {
-      "enabled": {
-        "type": "boolean",
-        "default": false
-      },
       "backend": {
         "type": "string",
         "enum": [

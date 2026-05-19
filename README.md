@@ -64,7 +64,6 @@ The command returns deterministic text directly from the plugin. It does not cal
 
 ```json
 {
-  "enabled": true,
   "backend": "rg",
   "fallbackToNode": true,
   "defaultLimit": 8,

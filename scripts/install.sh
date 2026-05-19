@@ -3,7 +3,7 @@ set -euo pipefail
 
 PLUGIN_ID="session-search"
 DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/openclaw-session-search-0.1.0.tgz"
-DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git"
+DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git#feat/session-search-ui-refresh"
 
 if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
   OPENCLAW_STATE_DIR_RESOLVED="$OPENCLAW_STATE_DIR"
@@ -132,6 +132,36 @@ for (const report of reports) console.log(report);
 NODE
 }
 
+remove_legacy_config_enabled() {
+  OPENCLAW_STATE_DIR="$OPENCLAW_STATE_DIR_RESOLVED" node <<'NODE'
+const fs = require('fs');
+const path = require('path');
+
+const home = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME || '/root', '.openclaw');
+const configPath = path.join(home, 'openclaw.json');
+
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+} catch {
+  process.exit(0);
+}
+
+const entry = config.plugins?.entries?.['session-search'];
+if (!entry?.config || !Object.prototype.hasOwnProperty.call(entry.config, 'enabled')) {
+  process.exit(0);
+}
+
+delete entry.config.enabled;
+if (Object.keys(entry.config).length === 0) {
+  delete entry.config;
+}
+
+fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+console.log('removed legacy plugins.entries.session-search.config.enabled');
+NODE
+}
+
 install_plugin() {
   local tmpdir package_file
   tmpdir="$(mktemp -d)"
@@ -161,6 +191,8 @@ configure_plugin() {
   }
 }
 JSON
+
+  remove_legacy_config_enabled
 }
 
 restart_gateway() {
@@ -220,6 +252,7 @@ main() {
   need_cmd node
 
   log "OPENCLAW_STATE_DIR=$OPENCLAW_STATE_DIR_RESOLVED"
+  remove_legacy_config_enabled
   install_plugin
   openclaw plugins enable "$PLUGIN_ID" || true
   configure_plugin

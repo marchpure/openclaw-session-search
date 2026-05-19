@@ -5,7 +5,6 @@ import { spawn } from "node:child_process";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 const DEFAULTS = {
-  enabled: false,
   backend: "rg",
   fallbackToNode: true,
   defaultLimit: 8,
@@ -38,7 +37,6 @@ function clampInt(value, fallback, min, max) {
 function resolveConfig(raw) {
   const cfg = asRecord(raw);
   return {
-    enabled: typeof cfg.enabled === "boolean" ? cfg.enabled : DEFAULTS.enabled,
     backend: cfg.backend === "node" ? "node" : DEFAULTS.backend,
     fallbackToNode:
       typeof cfg.fallbackToNode === "boolean" ? cfg.fallbackToNode : DEFAULTS.fallbackToNode,
@@ -1025,13 +1023,6 @@ export default definePluginEntry({
       "session-search.search",
       async ({ params, respond }) => {
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          respond(false, undefined, {
-            code: "disabled",
-            message: "session-search plugin is disabled",
-          });
-          return;
-        }
         try {
           respond(true, await sessionSearch(asRecord(params), cfg));
         } catch (error) {
@@ -1047,7 +1038,6 @@ export default definePluginEntry({
   api.registerTool(
       () => {
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) return null;
         return {
           name: "session_search",
           label: "Session Search",
@@ -1111,9 +1101,6 @@ export default definePluginEntry({
           return { text: "Usage: /session-search <keyword>" };
         }
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          return { text: "Session search is disabled." };
-        }
         const result = await sessionSearch(
           {
             query,
