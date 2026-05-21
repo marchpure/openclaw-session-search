@@ -434,36 +434,44 @@ function hasHan(value) {
   return /[\p{Script=Han}]/u.test(value);
 }
 
-function meaningfulJiebaTerm(term) {
+function isLatinOnly(value) {
+  return /^[a-z]+$/i.test(value);
+}
+
+function isMeaningfulTerm(term, raw = "") {
   if (!term) return false;
   if (/^\s+$/.test(term)) return false;
   if (/^[^\p{L}\p{N}_-]+$/u.test(term)) return false;
   if (isHanOnly(term) && (term.length <= 1 || LOW_SIGNAL_HAN_TERMS.has(term))) return false;
-  if (/^[a-z]$/i.test(term)) return false;
+  if (isLatinOnly(term) && term.length <= 2 && !String(raw).includes(term.toUpperCase())) return false;
   return term.length >= 2 || !isHanOnly(term);
 }
 
-function segmentHanWithJieba(text) {
+function segmentWithJieba(text) {
   if (!JIEBA_SEGMENTER) return [];
   try {
     return JIEBA_SEGMENTER.cutForSearch(String(text ?? ""), true)
       .map(normalizeTerm)
-      .filter(meaningfulJiebaTerm);
+      .filter((term) => isMeaningfulTerm(term, text));
   } catch {
     return [];
   }
 }
 
-function fallbackHanTerms(text) {
+function fallbackSegmentTerms(text) {
   const terms = [];
-  for (const run of String(text ?? "").match(/[\p{Script=Han}]+/gu) ?? []) {
-    if (run.length >= 2 && !LOW_SIGNAL_HAN_TERMS.has(run)) terms.push(run);
-  }
+  for (const run of splitScriptRuns(text)) terms.push(run);
   return terms;
 }
 
 function tokenize(text) {
   return buildQueryPlan(text).terms;
+}
+
+function minRequiredTermMatches(termCount) {
+  if (termCount <= 1) return termCount;
+  if (termCount === 2) return 2;
+  return Math.max(2, Math.ceil(termCount * 0.7));
 }
 
 function buildQueryPlan(text) {
@@ -477,37 +485,41 @@ function buildQueryPlan(text) {
   const scriptTokens = splitScriptRuns(raw)
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const jiebaTokens = segmentHanWithJieba(raw);
-  const hanTokens = jiebaTokens.length > 0 ? jiebaTokens : fallbackHanTerms(raw);
+  const segmentedTokens = segmentWithJieba(raw);
+  const fallbackTokens = fallbackSegmentTerms(raw)
+    .map(normalizeTerm)
+    .filter((term) => isMeaningfulTerm(term, raw));
+  const semanticTokens = segmentedTokens.length > 0 ? segmentedTokens : fallbackTokens;
   const timeTokens = normalizeTimeLikeTokens(raw).map((item) => item.toLowerCase());
   const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens];
+  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...semanticTokens, ...timeTokens, ...symbolTokens];
   const terms = uniqueTerms([...baseTokens, ...separatorVariants(baseTokens)]);
-  const meaningfulHanTerms = uniqueTerms(hanTokens.filter(meaningfulJiebaTerm));
+  const meaningfulTerms = uniqueTerms(semanticTokens.filter((term) => isMeaningfulTerm(term, raw)));
+  const requiredTermMatches = minRequiredTermMatches(meaningfulTerms.length);
   return {
     raw,
     rawLower,
     hasHan: hasHan(raw),
     terms,
     rgTerms: terms,
-    hanTerms: meaningfulHanTerms,
-    requireHanCoverage: hasHan(raw) && raw.length >= 5 && meaningfulHanTerms.length >= 2,
+    meaningfulTerms,
+    requiredTermMatches,
+    allowRawPhrase: meaningfulTerms.length > 0,
+    requireTermCoverage: true,
   };
 }
 
 function acceptMatch(lowerText, plan, match) {
   if (!match || match.score <= 0) return false;
-  if (!plan?.requireHanCoverage) return true;
-  if (plan.rawLower && lowerText.includes(plan.rawLower)) return true;
+  if (!plan?.requireTermCoverage) return true;
+  if (plan.allowRawPhrase && plan.rawLower && lowerText.includes(plan.rawLower)) return true;
 
-  const matchedHanTerms = plan.hanTerms.filter((term) => lowerText.includes(term));
-  if (matchedHanTerms.length === 0) return false;
-  const required = plan.hanTerms.length <= 2
-    ? plan.hanTerms.length
-    : Math.max(2, Math.ceil(plan.hanTerms.length * 0.6));
-  return matchedHanTerms.length >= required;
+  const meaningfulTerms = plan.meaningfulTerms ?? [];
+  if (meaningfulTerms.length === 0) return false;
+  const matchedMeaningfulTerms = meaningfulTerms.filter((term) => lowerText.includes(term));
+  return matchedMeaningfulTerms.length >= plan.requiredTermMatches;
 }
 
 function matchText(text, planOrTerms) {
