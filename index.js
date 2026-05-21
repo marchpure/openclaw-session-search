@@ -120,6 +120,16 @@ function sessionsDirForAgent(agentId) {
   return path.join(stateRoot(), "agents", normalizeAgentId(agentId), "sessions");
 }
 
+function configuredAgentIds() {
+  const configPath = path.join(stateRoot(), "openclaw.json");
+  const config = safeReadJson(configPath);
+  const agents = Array.isArray(config.agents?.list) ? config.agents.list : [];
+  const ids = agents
+    .map((agent) => normalizeAgentId(agent?.id))
+    .filter((agentId) => fs.existsSync(sessionsDirForAgent(agentId)));
+  return Array.from(new Set(ids.length > 0 ? ids : ["main"]));
+}
+
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
@@ -460,7 +470,15 @@ function segmentWithJieba(text) {
 
 function fallbackSegmentTerms(text) {
   const terms = [];
-  for (const run of splitScriptRuns(text)) terms.push(run);
+  for (const run of splitScriptRuns(text)) {
+    if (isHanOnly(run) && run.length > 2) {
+      for (let index = 0; index < run.length - 1; index += 1) {
+        terms.push(run.slice(index, index + 2));
+      }
+    } else {
+      terms.push(run);
+    }
+  }
   return terms;
 }
 
@@ -979,15 +997,43 @@ function cleanDisplaySnippet(value, query) {
   return singleLine(text, 96);
 }
 
+function parseSessionSearchCommandArgs(args) {
+  const tokens = String(args ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  let agentId = "";
+  const queryParts = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--agent" || token === "--agent-id" || token === "--agentId") {
+      agentId = tokens[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    const match = token.match(/^agentId=(.+)$/i) || token.match(/^agent=(.+)$/i);
+    if (match) {
+      agentId = match[1];
+      continue;
+    }
+    queryParts.push(token);
+  }
+  return {
+    query: queryParts.join(" ").trim(),
+    agentId: agentId.trim(),
+  };
+}
+
 function formatSessionSearchCommandReply(result) {
   const filtered =
     result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal;
   const sessions = Array.isArray(result.results) ? result.results : [];
   const hitCount = Number(result.hitCount ?? 0);
+  const agentCount = Array.isArray(result.agentsSearched) ? result.agentsSearched.length : 1;
   const lines = [
     `历史会话搜索：${result.query}`,
     "",
-    `结果 ${sessions.length} 个会话 | 命中 ${hitCount} 次 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
+    `结果 ${sessions.length} 个会话 | 命中 ${hitCount} 次 | agent ${agentCount} 个 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
   ];
   if (!sessions.length) {
     lines.push("", "未找到匹配的用户可见会话。");
@@ -999,6 +1045,7 @@ function formatSessionSearchCommandReply(result) {
     const displayName = item.displayName || item.label || item.key || item.sessionId || "session";
     const recentHits = Array.isArray(item.hits) ? item.hits.slice(0, 2) : [];
     lines.push(`--- ${index + 1}/${sessions.length} ---`);
+    if (item.agentId) lines.push(`Agent：${singleLine(item.agentId, 48)}`);
     lines.push(`会话：${singleLine(displayName, 56)}`);
     lines.push(`命中次数：${item.hitCount || recentHits.length}`);
     if (item.key && item.key !== displayName) lines.push(`会话ID：${singleLine(item.key, 96)}`);
@@ -1117,6 +1164,7 @@ async function sessionSearch(params, cfg) {
     results: sessionGroups.map((group) => ({
       key: group.key,
       label: group.label,
+      agentId,
       displayName: group.label || group.key || group.sessionId || "session",
       sessionId: group.sessionId,
       updatedAt: group.updatedAt,
@@ -1134,6 +1182,101 @@ async function sessionSearch(params, cfg) {
   };
 }
 
+async function sessionSearchAllAgents(params, cfg) {
+  const startedAt = Date.now();
+  const query = typeof params.query === "string" ? params.query.trim() : "";
+  if (!query) throw new Error("query is required");
+  const limit = clampInt(params.limit, cfg.defaultLimit, 1, 50);
+  const agentIds = configuredAgentIds();
+  const perAgentLimit = Math.max(limit, 5);
+  const results = await Promise.all(
+    agentIds.map((agentId) =>
+      sessionSearch(
+        {
+          ...params,
+          agentId,
+          limit: perAgentLimit,
+        },
+        cfg,
+      ),
+    ),
+  );
+  const mergedGroups = results
+    .flatMap((result) =>
+      (Array.isArray(result.sessionGroups) ? result.sessionGroups : []).map((group) => ({
+        ...group,
+        agentId: result.agentId,
+        key: `${result.agentId}:${group.key || group.sessionId || "unknown"}`,
+        displayName: group.displayName || group.label || group.key || group.sessionId || "session",
+        hits: Array.isArray(group.hits)
+          ? group.hits.map((hit) => ({ ...hit, agentId: result.agentId }))
+          : [],
+      })),
+    )
+    .sort(
+      (a, b) =>
+        Number(b.bestHit?.matchedTerms || 0) - Number(a.bestHit?.matchedTerms || 0) ||
+        Number(b.bestHit?.score || 0) - Number(a.bestHit?.score || 0) ||
+        Number(b.bestHit?.timestamp || b.lastMessageAt || b.updatedAt || 0) -
+          Number(a.bestHit?.timestamp || a.lastMessageAt || a.updatedAt || 0),
+    )
+    .slice(0, limit);
+  const backends = Array.from(new Set(results.map((result) => result.backend).filter(Boolean)));
+  return {
+    query,
+    agentId: "all",
+    agentsSearched: agentIds,
+    backend: backends.join("+") || cfg.backend,
+    candidateSessions: results.reduce((sum, result) => sum + Number(result.candidateSessions || 0), 0),
+    visibleSessions: results.reduce((sum, result) => sum + Number(result.visibleSessions || 0), 0),
+    searchedSessions: results.reduce((sum, result) => sum + Number(result.searchedSessions || 0), 0),
+    searchedFiles: results.reduce((sum, result) => sum + Number(result.searchedFiles || 0), 0),
+    skippedMissing: results.reduce((sum, result) => sum + Number(result.skippedMissing || 0), 0),
+    skippedLarge: results.reduce((sum, result) => sum + Number(result.skippedLarge || 0), 0),
+    skippedUnsafePath: results.reduce((sum, result) => sum + Number(result.skippedUnsafePath || 0), 0),
+    skippedIgnoredTranscript: results.reduce(
+      (sum, result) => sum + Number(result.skippedIgnoredTranscript || 0),
+      0,
+    ),
+    filteredSubagent: results.reduce((sum, result) => sum + Number(result.filteredSubagent || 0), 0),
+    filteredCron: results.reduce((sum, result) => sum + Number(result.filteredCron || 0), 0),
+    filteredTool: results.reduce((sum, result) => sum + Number(result.filteredTool || 0), 0),
+    filteredInternal: results.reduce((sum, result) => sum + Number(result.filteredInternal || 0), 0),
+    sinceDays: clampInt(params.sinceDays, cfg.sinceDays, 0, 3650),
+    maxTranscriptBytes: clampInt(
+      params.maxTranscriptBytes,
+      cfg.maxTranscriptBytes,
+      4096,
+      2 * 1024 * 1024,
+    ),
+    tookMs: Date.now() - startedAt,
+    count: mergedGroups.length,
+    hitCount: results.reduce((sum, result) => sum + Number(result.hitCount || 0), 0),
+    results: mergedGroups.map((group) => ({
+      key: group.key,
+      label: group.label,
+      agentId: group.agentId,
+      displayName: group.displayName,
+      sessionId: group.sessionId,
+      updatedAt: group.updatedAt,
+      createdAt: group.createdAt,
+      lastMessageAt: group.lastMessageAt,
+      hitCount: group.hitCount,
+      hits: group.hits,
+    })),
+    sessionGroupCount: mergedGroups.length,
+    sessionGroups: mergedGroups,
+    debug: {
+      agents: results.map((result) => ({
+        agentId: result.agentId,
+        searchedFiles: result.searchedFiles,
+        hitCount: result.hitCount,
+        backend: result.backend,
+      })),
+    },
+  };
+}
+
 export default definePluginEntry({
   id: "session-search",
   name: "Session Search",
@@ -1144,7 +1287,12 @@ export default definePluginEntry({
       async ({ params, respond }) => {
         const cfg = resolveConfig(api.pluginConfig);
         try {
-          respond(true, await sessionSearch(asRecord(params), cfg));
+          const input = asRecord(params);
+          const result =
+            typeof input.agentId === "string" && input.agentId.trim()
+              ? await sessionSearch(input, cfg)
+              : await sessionSearchAllAgents(input, cfg);
+          respond(true, result);
         } catch (error) {
           respond(false, undefined, {
             code: "session_search_failed",
@@ -1162,14 +1310,17 @@ export default definePluginEntry({
           name: "session_search",
           label: "Session Search",
           description:
-            "Search prior OpenClaw session transcripts. Use for low-frequency recall of previous conversations, tasks, decisions, or blocked work. This is independent from memory_recall and does not use the memory slot.",
+            "Search prior OpenClaw session transcripts across all active agents by default. Use for low-frequency recall of previous conversations, tasks, decisions, or blocked work. This is independent from memory_recall and does not use the memory slot.",
           parameters: {
             type: "object",
             additionalProperties: false,
             required: ["query"],
             properties: {
               query: { type: "string", description: "Search query." },
-              agentId: { type: "string", description: "Agent id to search, default main." },
+              agentId: {
+                type: "string",
+                description: "Optional agent id to search. If omitted, searches all active agents.",
+              },
               limit: { type: "number", description: "Maximum results, default plugin config." },
               maxSessions: { type: "number", description: "Maximum recent sessions to scan." },
               maxFiles: { type: "number", description: "Maximum transcript files to scan." },
@@ -1195,7 +1346,11 @@ export default definePluginEntry({
             },
           },
           async execute(_toolCallId, params) {
-            const result = await sessionSearch(asRecord(params), cfg);
+            const input = asRecord(params);
+            const result =
+              typeof input.agentId === "string" && input.agentId.trim()
+                ? await sessionSearch(input, cfg)
+                : await sessionSearchAllAgents(input, cfg);
             return {
               content: [
                 {
@@ -1216,22 +1371,21 @@ export default definePluginEntry({
       acceptsArgs: true,
       requireAuth: true,
       async handler(ctx) {
-        const query = typeof ctx.args === "string" ? ctx.args.trim() : "";
+        const { query, agentId } = parseSessionSearchCommandArgs(ctx.args);
         if (!query) {
-          return { text: "Usage: /session-search <keyword>" };
+          return { text: "Usage: /session-search [--agent <agentId>] <keyword>" };
         }
         const cfg = resolveConfig(api.pluginConfig);
-        const result = await sessionSearch(
-          {
-            query,
-            agentId: "main",
-            sinceDays: cfg.sinceDays,
-            limit: Math.min(cfg.defaultLimit, 5),
-            maxChars: 240,
-            includeAssistant: cfg.includeAssistantByDefault,
-          },
-          cfg,
-        );
+        const input = {
+          query,
+          sinceDays: cfg.sinceDays,
+          limit: Math.min(cfg.defaultLimit, 5),
+          maxChars: 240,
+          includeAssistant: cfg.includeAssistantByDefault,
+        };
+        const result = agentId
+          ? await sessionSearch({ ...input, agentId }, cfg)
+          : await sessionSearchAllAgents(input, cfg);
         return { text: formatSessionSearchCommandReply(result) };
       },
     });
