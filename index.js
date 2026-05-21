@@ -247,6 +247,11 @@ function listSessionEntries(agentId, opts) {
   return { sessions, stats };
 }
 
+function isIgnoredTranscriptFile(filePath) {
+  const name = path.basename(String(filePath ?? "")).toLowerCase();
+  return /(^|[._-])(reset|delete|deleted)([._-]|$)/.test(name);
+}
+
 function listLegacyTranscriptEntries(dir, indexedSessionIds) {
   if (!fs.existsSync(dir)) return [];
   let names = [];
@@ -256,6 +261,7 @@ function listLegacyTranscriptEntries(dir, indexedSessionIds) {
     return [];
   }
   return names
+    .filter((name) => !isIgnoredTranscriptFile(name))
     .filter((name) => name.endsWith(".jsonl"))
     .filter((name) => !indexedSessionIds.has(path.basename(name, ".jsonl")))
     .map((name) => {
@@ -580,9 +586,14 @@ function searchableSessions(sessions, opts) {
   let skippedMissing = 0;
   let skippedLarge = 0;
   let skippedUnsafePath = 0;
+  let skippedIgnoredTranscript = 0;
   for (const session of sessions) {
     if (!session.sessionFile || !fs.existsSync(session.sessionFile)) {
       skippedMissing += 1;
+      continue;
+    }
+    if (isIgnoredTranscriptFile(session.sessionFile)) {
+      skippedIgnoredTranscript += 1;
       continue;
     }
     if (opts.sessionsDir && !isPathInside(opts.sessionsDir, session.sessionFile)) {
@@ -593,7 +604,7 @@ function searchableSessions(sessions, opts) {
     accepted.push({ ...session, size, tailOnly: size > opts.maxTranscriptBytes });
     if (accepted.length >= opts.maxFiles) break;
   }
-  return { sessions: accepted, skippedMissing, skippedLarge, skippedUnsafePath };
+  return { sessions: accepted, skippedMissing, skippedLarge, skippedUnsafePath, skippedIgnoredTranscript };
 }
 
 function isPathInside(parentDir, childPath) {
@@ -1081,6 +1092,7 @@ async function sessionSearch(params, cfg) {
     skippedMissing: selected.skippedMissing,
     skippedLarge: selected.skippedLarge,
     skippedUnsafePath: selected.skippedUnsafePath,
+    skippedIgnoredTranscript: selected.skippedIgnoredTranscript,
     filteredSubagent: listed.stats.filteredSubagent,
     filteredCron: listed.stats.filteredCron,
     filteredTool: listed.stats.filteredTool,
