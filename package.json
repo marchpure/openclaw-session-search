@@ -22,6 +22,9 @@
     "ripgrep"
   ],
   "license": "MIT",
+  "dependencies": {
+    "@node-rs/jieba": "^2.0.1"
+  },
   "peerDependencies": {
     "openclaw": "*"
   },

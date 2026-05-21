@@ -2,7 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+
+const require = createRequire(import.meta.url);
 
 const DEFAULTS = {
   backend: "rg",
@@ -23,6 +26,32 @@ const DEFAULTS = {
 };
 
 const SEARCHABLE_ROLES = new Set(["user", "assistant", "system"]);
+const LOW_SIGNAL_HAN_TERMS = new Set([
+  "的",
+  "了",
+  "在",
+  "是",
+  "到",
+  "和",
+  "或",
+  "与",
+  "及",
+  "未",
+]);
+
+function createJiebaSegmenter() {
+  try {
+    const mod = require("@node-rs/jieba");
+    if (typeof mod?.Jieba === "function") {
+      return new mod.Jieba();
+    }
+  } catch {
+    // Keep the plugin usable when optional native segmentation is unavailable.
+  }
+  return null;
+}
+
+const JIEBA_SEGMENTER = createJiebaSegmenter();
 
 function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -341,17 +370,6 @@ function splitScriptRuns(text) {
     .match(/[\p{Script=Han}]+|[\p{Script=Latin}\p{N}_-]+|[^\s\p{L}\p{N}]+/gu) ?? [];
 }
 
-function hanBigrams(text) {
-  const grams = [];
-  for (const run of String(text ?? "").match(/[\p{Script=Han}]{3,}/gu) ?? []) {
-    const chars = Array.from(run);
-    for (let i = 0; i < chars.length - 1; i += 1) {
-      grams.push(`${chars[i]}${chars[i + 1]}`);
-    }
-  }
-  return grams;
-}
-
 function separatorVariants(tokens) {
   const variants = [];
   for (const token of tokens) {
@@ -394,8 +412,57 @@ function normalizeTimeLikeTokens(text) {
   return tokens;
 }
 
+function normalizeTerm(value) {
+  return String(value ?? "").toLowerCase().trim();
+}
+
+function uniqueTerms(items) {
+  return Array.from(new Set(items.map(normalizeTerm).filter(Boolean)));
+}
+
+function isHanOnly(value) {
+  return /^[\p{Script=Han}]+$/u.test(value);
+}
+
+function hasHan(value) {
+  return /[\p{Script=Han}]/u.test(value);
+}
+
+function meaningfulJiebaTerm(term) {
+  if (!term) return false;
+  if (/^\s+$/.test(term)) return false;
+  if (/^[^\p{L}\p{N}_-]+$/u.test(term)) return false;
+  if (isHanOnly(term) && (term.length <= 1 || LOW_SIGNAL_HAN_TERMS.has(term))) return false;
+  if (/^[a-z]$/i.test(term)) return false;
+  return term.length >= 2 || !isHanOnly(term);
+}
+
+function segmentHanWithJieba(text) {
+  if (!JIEBA_SEGMENTER) return [];
+  try {
+    return JIEBA_SEGMENTER.cutForSearch(String(text ?? ""), true)
+      .map(normalizeTerm)
+      .filter(meaningfulJiebaTerm);
+  } catch {
+    return [];
+  }
+}
+
+function fallbackHanTerms(text) {
+  const terms = [];
+  for (const run of String(text ?? "").match(/[\p{Script=Han}]+/gu) ?? []) {
+    if (run.length >= 2 && !LOW_SIGNAL_HAN_TERMS.has(run)) terms.push(run);
+  }
+  return terms;
+}
+
 function tokenize(text) {
+  return buildQueryPlan(text).terms;
+}
+
+function buildQueryPlan(text) {
   const raw = String(text ?? "").trim();
+  const rawLower = raw.toLowerCase();
   const tokens = raw
     .toLowerCase()
     .split(/[^\p{L}\p{N}_-]+/u)
@@ -404,16 +471,42 @@ function tokenize(text) {
   const scriptTokens = splitScriptRuns(raw)
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const hanTokens = hanBigrams(raw);
+  const jiebaTokens = segmentHanWithJieba(raw);
+  const hanTokens = jiebaTokens.length > 0 ? jiebaTokens : fallbackHanTerms(raw);
   const timeTokens = normalizeTimeLikeTokens(raw).map((item) => item.toLowerCase());
   const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const baseTokens = [raw.toLowerCase(), ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens];
-  return Array.from(new Set([...baseTokens, ...separatorVariants(baseTokens)]));
+  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens];
+  const terms = uniqueTerms([...baseTokens, ...separatorVariants(baseTokens)]);
+  const meaningfulHanTerms = uniqueTerms(hanTokens.filter(meaningfulJiebaTerm));
+  return {
+    raw,
+    rawLower,
+    hasHan: hasHan(raw),
+    terms,
+    rgTerms: terms,
+    hanTerms: meaningfulHanTerms,
+    requireHanCoverage: hasHan(raw) && raw.length >= 5 && meaningfulHanTerms.length >= 2,
+  };
 }
 
-function matchText(text, terms) {
+function acceptMatch(lowerText, plan, match) {
+  if (!match || match.score <= 0) return false;
+  if (!plan?.requireHanCoverage) return true;
+  if (plan.rawLower && lowerText.includes(plan.rawLower)) return true;
+
+  const matchedHanTerms = plan.hanTerms.filter((term) => lowerText.includes(term));
+  if (matchedHanTerms.length === 0) return false;
+  const required = plan.hanTerms.length <= 2
+    ? plan.hanTerms.length
+    : Math.max(2, Math.ceil(plan.hanTerms.length * 0.6));
+  return matchedHanTerms.length >= required;
+}
+
+function matchText(text, planOrTerms) {
+  const plan = Array.isArray(planOrTerms) ? { terms: planOrTerms } : planOrTerms;
+  const terms = Array.isArray(planOrTerms) ? planOrTerms : planOrTerms?.terms ?? [];
   const lower = text.toLowerCase();
   let score = 0;
   let matchedTerms = 0;
@@ -428,7 +521,9 @@ function matchText(text, terms) {
     }
     if (matched) matchedTerms += 1;
   }
-  return { score: score + Math.max(0, matchedTerms - 1) * 5, matchedTerms };
+  const result = { score: score + Math.max(0, matchedTerms - 1) * 5, matchedTerms };
+  if (!acceptMatch(lower, plan, result)) return { score: 0, matchedTerms };
+  return result;
 }
 
 function isPluginGeneratedTranscriptText(text) {
@@ -508,7 +603,7 @@ function isPathInside(parentDir, childPath) {
   return relative === "" || Boolean(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function searchTranscriptNode(session, terms, opts) {
+function searchTranscriptNode(session, queryPlan, opts) {
   if (!session.sessionFile || !fs.existsSync(session.sessionFile)) return [];
   const stat = fs.statSync(session.sessionFile);
   const fd = fs.openSync(session.sessionFile, "r");
@@ -525,7 +620,7 @@ function searchTranscriptNode(session, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const match = matchText(buildSearchText(session, msg), terms);
+    const match = matchText(buildSearchText(session, msg), queryPlan);
     const score = match.score;
     if (score <= 0) continue;
     hits.push({
@@ -540,7 +635,7 @@ function searchTranscriptNode(session, terms, opts) {
       role: msg.role,
       line: i + 1,
       timestamp: msg.timestamp,
-      snippet: snippet(msg.text, terms, opts.maxChars),
+      snippet: snippet(msg.text, queryPlan.terms, opts.maxChars),
     });
   }
   return hits;
@@ -615,7 +710,7 @@ function runRgBatch({ rgCommand, terms, files, timeoutMs }) {
   });
 }
 
-function parseRgMatches(stdout, sessionByFile, terms, opts) {
+function parseRgMatches(stdout, sessionByFile, queryPlan, opts) {
   const hits = [];
   for (const rawLine of stdout.split(/\r?\n/)) {
     if (!rawLine.trim()) continue;
@@ -636,10 +731,11 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const match = matchText(buildSearchText(session, msg), terms);
+    const match = matchText(buildSearchText(session, msg), queryPlan);
     const score = match.score;
+    if (score <= 0) continue;
     hits.push({
-      score: score > 0 ? score : 1,
+      score,
       matchedTerms: match.matchedTerms,
       key: session.key,
       label: session.label,
@@ -650,13 +746,13 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
       role: msg.role,
       line: Number(event.data?.line_number || 0),
       timestamp: msg.timestamp,
-      snippet: snippet(msg.text, terms, opts.maxChars),
+      snippet: snippet(msg.text, queryPlan.terms, opts.maxChars),
     });
   }
   return hits;
 }
 
-async function searchWithRg(sessions, terms, opts) {
+async function searchWithRg(sessions, queryPlan, opts) {
   const rgCommand = findRgCommand();
   const rgSessions = sessions.filter((session) => !session.tailOnly);
   const tailSessions = sessions.filter((session) => session.tailOnly);
@@ -671,18 +767,18 @@ async function searchWithRg(sessions, terms, opts) {
   for (const batch of chunkArray(files, opts.rgBatchSize)) {
     const result = await runRgBatch({
       rgCommand,
-      terms,
+      terms: queryPlan.rgTerms,
       files: batch,
       timeoutMs: opts.timeoutMs,
     });
     if (result.timedOut) timedOut = true;
     if (!result.ok) failed = true;
     if (result.stderr) stderr = result.stderr.slice(0, 1000);
-    hits.push(...parseRgMatches(result.stdout, sessionByFile, terms, opts));
+    hits.push(...parseRgMatches(result.stdout, sessionByFile, queryPlan, opts));
     if (hits.length >= opts.limit * 8 || timedOut || failed) break;
   }
   if (!timedOut && !failed && hits.length < opts.limit * 8 && tailSessions.length > 0) {
-    hits.push(...searchWithNode(tailSessions, terms, opts).hits);
+    hits.push(...searchWithNode(tailSessions, queryPlan, opts).hits);
   }
   return {
     hits,
@@ -734,8 +830,8 @@ function buildSessionMetadataSearchText(session) {
     .join("\n");
 }
 
-function searchSessionMetadata(session, terms, opts) {
-  const match = matchText(buildSessionMetadataSearchText(session), terms);
+function searchSessionMetadata(session, queryPlan, opts) {
+  const match = matchText(buildSessionMetadataSearchText(session), queryPlan);
   if (match.score <= 0) return null;
   return {
     score: match.score,
@@ -749,7 +845,7 @@ function searchSessionMetadata(session, terms, opts) {
     role: "system",
     line: 0,
     timestamp: session.lastMessageAt || session.updatedAt || session.createdAt,
-    snippet: snippet(buildSessionMetadataSearchText(session), terms, opts.maxChars),
+    snippet: snippet(buildSessionMetadataSearchText(session), queryPlan.terms, opts.maxChars),
   };
 }
 
@@ -806,10 +902,10 @@ function groupHitsBySession(hits, maxHitsPerSession = 2) {
   return groups;
 }
 
-function searchWithNode(sessions, terms, opts) {
+function searchWithNode(sessions, queryPlan, opts) {
   return {
     hits: sessions.flatMap((session) =>
-      searchTranscriptNode(session, terms, {
+      searchTranscriptNode(session, queryPlan, {
         includeAssistant: opts.includeAssistant,
         excludePluginOutputs: opts.excludePluginOutputs,
         maxChars: opts.maxChars,
@@ -928,8 +1024,8 @@ async function sessionSearch(params, cfg) {
     typeof params.includeAssistant === "boolean"
       ? params.includeAssistant
       : cfg.includeAssistantByDefault;
-  const terms = Array.from(new Set(tokenize(query)));
-  if (terms.length === 0) throw new Error("query has no searchable terms");
+  const queryPlan = buildQueryPlan(query);
+  if (queryPlan.terms.length === 0) throw new Error("query has no searchable terms");
   const listed = listSessionEntries(agentId, {
     maxSessions,
     sinceDays,
@@ -954,14 +1050,14 @@ async function sessionSearch(params, cfg) {
   };
   let search =
     cfg.backend === "rg"
-      ? await searchWithRg(selectedSessions, terms, searchOpts)
-      : searchWithNode(selectedSessions, terms, searchOpts);
+      ? await searchWithRg(selectedSessions, queryPlan, searchOpts)
+      : searchWithNode(selectedSessions, queryPlan, searchOpts);
   if (search.meta.failed && cfg.fallbackToNode) {
-    search = searchWithNode(selectedSessions, terms, searchOpts);
+    search = searchWithNode(selectedSessions, queryPlan, searchOpts);
     search.meta.fallbackFrom = "rg";
   }
   const metadataHits = selectedSessions
-    .map((session) => searchSessionMetadata(session, terms, searchOpts))
+    .map((session) => searchSessionMetadata(session, queryPlan, searchOpts))
     .filter(Boolean);
   const sortedHits = search.hits
     .concat(metadataHits)
