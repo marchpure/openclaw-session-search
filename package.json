@@ -1,6 +1,6 @@
 {
   "name": "openclaw-session-search",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "type": "module",
   "description": "OpenClaw plugin for deterministic rg-backed session transcript search.",
