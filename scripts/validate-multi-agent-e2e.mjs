@@ -9,7 +9,10 @@ const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-session-search-
 const pluginRoot = path.join(workRoot, "plugin");
 const stateRoot = path.join(workRoot, "state");
 const fakeDistDir = path.join(workRoot, "dist");
-const AGENTS = ["ai-1111", "ai-2222", "ai-3333", "main"];
+const AGENTS = ["a-mpgtowbf5xplok", "ai-2222", "ai-3333", "main"];
+const SCOPED_LABEL_AGENT = "a-mpgtowbf5xplok";
+const SCOPED_LABEL_SESSION_NAME = "web-23771cfd-cf5a-49e8-aca3-4dc20098250c";
+const SCOPED_LABEL_TITLE = "沪市今天的指数";
 const TARGET_CASES = 1000;
 
 function writeJson(file, value) {
@@ -117,6 +120,13 @@ function createFixture() {
       text: "历史会话搜索：project-x",
       updatedAt: now,
     });
+    if (agentId === SCOPED_LABEL_AGENT) {
+      addSession(store, dir, agentId, SCOPED_LABEL_SESSION_NAME, {
+        label: `<agent:${agentId}:${SCOPED_LABEL_SESSION_NAME}>${SCOPED_LABEL_TITLE}`,
+        text: `${SCOPED_LABEL_TITLE} project-x market summary`,
+        updatedAt: now + 1000,
+      });
+    }
     writeJson(path.join(dir, "sessions.json"), store);
   }
 }
@@ -253,6 +263,18 @@ assertCase(
   allAgentResult.results.every((row) => !Object.hasOwn(row, "agentScopedKey")),
   allAgentResult.results.slice(0, 3),
 );
+
+const scopedLabelKey = `agent:${SCOPED_LABEL_AGENT}:${SCOPED_LABEL_SESSION_NAME}`;
+const scopedLabelResult = await callMethod(methods, "session-search.search", {
+  query: SCOPED_LABEL_TITLE,
+  limit: 5,
+  sinceDays: 3650,
+  maxSessions: 1000,
+  maxFiles: 1000,
+});
+const scopedLabelRow = scopedLabelResult.results.find((row) => row.key === scopedLabelKey);
+assertCase(cases, "cross-agent", "scoped label result keeps original key", scopedLabelRow?.key === scopedLabelKey, scopedLabelResult.results);
+assertCase(cases, "experience", "scoped label display strips agent wrapper", scopedLabelRow?.displayName === SCOPED_LABEL_TITLE, scopedLabelRow);
 
 const sortedTimings = [...timings].sort((a, b) => a - b);
 const percentile = (p) => Math.round(sortedTimings[Math.min(sortedTimings.length - 1, Math.floor(sortedTimings.length * p))] || 0);

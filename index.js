@@ -909,7 +909,8 @@ function formatSearchTimestamp(value) {
 }
 
 function normalizeSessionLabel(value) {
-  return typeof value === "string" ? value.trim() : "";
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^<agent:[^>]+>\s*/, "").trim();
 }
 
 function sessionDisplayName(session) {
