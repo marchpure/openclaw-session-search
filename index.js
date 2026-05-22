@@ -916,6 +916,40 @@ function sessionDisplayName(session) {
   return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
 }
 
+function hitSortTime(hit) {
+  return Number(hit?.timestamp || hit?.lastMessageAt || hit?.updatedAt || 0);
+}
+
+function scoreSessionHits(hits) {
+  const sorted = [...hits].sort(
+    (a, b) =>
+      Number(b.matchedTerms || 0) - Number(a.matchedTerms || 0) ||
+      Number(b.score || 0) - Number(a.score || 0) ||
+      hitSortTime(b) - hitSortTime(a),
+  );
+  const bestHit = sorted[0];
+  const topHitScore = sorted
+    .slice(1, 4)
+    .reduce((sum, hit) => sum + Number(hit.score || 0) * 0.25, 0);
+  return {
+    bestHit,
+    bestMatchedTerms: Number(bestHit?.matchedTerms || 0),
+    sessionScore:
+      Number(bestHit?.score || 0) + topHitScore + Math.log1p(sorted.length) * 2,
+    lastHitAt: sorted.reduce((latest, hit) => Math.max(latest, hitSortTime(hit)), 0),
+    hits: sorted,
+  };
+}
+
+function compareSessionGroups(a, b) {
+  return (
+    Number(b.bestMatchedTerms || 0) - Number(a.bestMatchedTerms || 0) ||
+    Number(b.sessionScore || 0) - Number(a.sessionScore || 0) ||
+    Number(b.lastHitAt || 0) - Number(a.lastHitAt || 0) ||
+    Number(b.updatedAt || 0) - Number(a.updatedAt || 0)
+  );
+}
+
 function groupHitsBySession(hits, maxHitsPerSession = 2) {
   const groups = [];
   const byKey = new Map();
@@ -931,16 +965,26 @@ function groupHitsBySession(hits, maxHitsPerSession = 2) {
         createdAt: hit.createdAt,
         lastMessageAt: hit.lastMessageAt,
         hitCount: 0,
-        bestHit: hit,
-        hits: [],
+        allHits: [],
       };
       byKey.set(key, group);
       groups.push(group);
     }
     group.hitCount += 1;
-    if (group.hits.length < maxHitsPerSession) group.hits.push(hit);
+    group.allHits.push(hit);
   }
-  return groups;
+  return groups.map((group) => {
+    const scored = scoreSessionHits(group.allHits);
+    return {
+      ...group,
+      bestHit: scored.bestHit,
+      bestMatchedTerms: scored.bestMatchedTerms,
+      sessionScore: scored.sessionScore,
+      lastHitAt: scored.lastHitAt,
+      hits: scored.hits.slice(0, maxHitsPerSession),
+      allHits: undefined,
+    };
+  });
 }
 
 function searchWithNode(sessions, queryPlan, opts) {
@@ -1138,8 +1182,7 @@ async function sessionSearch(params, cfg) {
         Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
           Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
     );
-  const results = sortedHits.slice(0, limit);
-  const sessionGroups = groupHitsBySession(sortedHits).slice(0, limit);
+  const sessionGroups = groupHitsBySession(sortedHits).sort(compareSessionGroups).slice(0, limit);
   return {
     query,
     agentId,
@@ -1215,10 +1258,7 @@ async function sessionSearchAllAgents(params, cfg) {
     )
     .sort(
       (a, b) =>
-        Number(b.bestHit?.matchedTerms || 0) - Number(a.bestHit?.matchedTerms || 0) ||
-        Number(b.bestHit?.score || 0) - Number(a.bestHit?.score || 0) ||
-        Number(b.bestHit?.timestamp || b.lastMessageAt || b.updatedAt || 0) -
-          Number(a.bestHit?.timestamp || a.lastMessageAt || a.updatedAt || 0),
+        compareSessionGroups(a, b),
     )
     .slice(0, limit);
   const backends = Array.from(new Set(results.map((result) => result.backend).filter(Boolean)));
