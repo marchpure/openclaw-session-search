@@ -72,6 +72,9 @@ function addSession(store, dir, agentId, name, { label, text, updatedAt, kind = 
 
 function createFixture() {
   const now = Date.now();
+  writeJson(path.join(stateRoot, "openclaw.json"), {
+    agents: { list: AGENTS.map((id) => ({ id })) },
+  });
   for (const agentId of AGENTS) {
     const dir = sessionsDir(agentId);
     fs.mkdirSync(dir, { recursive: true });
@@ -227,6 +230,29 @@ for (const agentId of AGENTS) {
 const grouped = groupByAgent(crossAgentHits);
 assertCase(cases, "cross-agent", "four agent groups present", Object.keys(grouped).length === 4, grouped);
 assertCase(cases, "cross-agent", "each group has at least ten sessions", Object.values(grouped).every((rows) => uniqueSessionKeys(rows).length >= 10), grouped);
+
+const allAgentResult = await callMethod(methods, "session-search.search", {
+  query: "project-x",
+  limit: 50,
+  sinceDays: 3650,
+  maxSessions: 1000,
+  maxFiles: 1000,
+});
+assertCase(cases, "cross-agent", "default search covers configured agents", allAgentResult.agentsSearched.length === AGENTS.length, allAgentResult);
+assertCase(
+  cases,
+  "cross-agent",
+  "all-agent keys keep original session key",
+  allAgentResult.results.every((row) => row.key.startsWith(`agent:${row.agentId}:`) && !row.key.startsWith(`${row.agentId}:`)),
+  allAgentResult.results.slice(0, 3),
+);
+assertCase(
+  cases,
+  "cross-agent",
+  "all-agent result does not add scoped key",
+  allAgentResult.results.every((row) => !Object.hasOwn(row, "agentScopedKey")),
+  allAgentResult.results.slice(0, 3),
+);
 
 const sortedTimings = [...timings].sort((a, b) => a - b);
 const percentile = (p) => Math.round(sortedTimings[Math.min(sortedTimings.length - 1, Math.floor(sortedTimings.length * p))] || 0);

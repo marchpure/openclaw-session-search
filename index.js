@@ -1249,7 +1249,6 @@ async function sessionSearchAllAgents(params, cfg) {
       (Array.isArray(result.sessionGroups) ? result.sessionGroups : []).map((group) => ({
         ...group,
         agentId: result.agentId,
-        key: `${result.agentId}:${group.key || group.sessionId || "unknown"}`,
         displayName: group.displayName || group.label || group.key || group.sessionId || "session",
         hits: Array.isArray(group.hits)
           ? group.hits.map((hit) => ({ ...hit, agentId: result.agentId }))
