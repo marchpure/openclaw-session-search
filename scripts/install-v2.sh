@@ -2,8 +2,8 @@
 set -euo pipefail
 
 PLUGIN_ID="session-search"
-DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/openclaw-session-search-0.2.0.tgz"
-DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git#feat/session-search-ui-refresh"
+DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/session-search-0.2.2.tgz"
+DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git#sync/session-search-ui-refresh-marchpure"
 
 if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
   OPENCLAW_STATE_DIR_RESOLVED="$OPENCLAW_STATE_DIR"
