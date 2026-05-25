@@ -202,6 +202,17 @@ function createFixture() {
       message("assistant", "代码符号示例：foo.bar(baz) path/to/file.js error_code=E_CONN_RESET", now - 21000),
     ],
   });
+  addSession({
+    key: "agent:main:metadata-title-session",
+    label: "保持心态轻松",
+    sessionId: "metadata-title-session",
+    updatedAt: now - 22000,
+    messages: [
+      sessionHeader("metadata-title-session", now - 610000),
+      message("user", "保持心态轻松", now - 600000),
+      message("assistant", "收到！随时待命。", now - 22000),
+    ],
+  });
 
   writeJsonl(path.join(sessionsDir, "legacy-viking-session.jsonl"), [
     sessionHeader("legacy-viking-session", now - 700000),
@@ -251,6 +262,16 @@ function createFixture() {
     });
   }
   writeJson(path.join(sessionsDir, "sessions.json"), store);
+  writeJson(path.join(stateRoot, "openclaw.json"), {
+    agents: {
+      list: [
+        {
+          id: "main",
+          name: "主 Agent",
+        },
+      ],
+    },
+  });
 }
 
 async function loadRegisteredMethods() {
@@ -327,6 +348,9 @@ addCase(cases, "search filters cron by default", searchHello.filteredCron === 12
 addCase(cases, "search filters subagents by default", searchHello.filteredSubagent === 120, "filtering");
 addCase(cases, "search exposes hit groups", searchHello.results.every((row) => Array.isArray(row.hits) && row.hits.length > 0), "display");
 addCase(cases, "search exposes session hit count", searchHello.results.every((row) => Number(row.hitCount) >= row.hits.length), "display");
+addCase(cases, "search exposes agent names", searchHello.results.every((row) => row.agentName === "主 Agent"), "display");
+addCase(cases, "search exposes display snippets", searchHello.results.every((row) => row.title && row.snippet), "display");
+addCase(cases, "search omits legacy sessionGroups", !Object.hasOwn(searchHello, "sessionGroups") && !Object.hasOwn(searchHello, "sessionGroupCount"), "compat");
 addCase(cases, "search excludes plugin generated assistant replies", searchHello.results.every((row) => !row.hits.some((hit) => String(hit.snippet || "").includes("未找到匹配的用户可见会话"))), "filtering");
 addCase(cases, "search filters plugin command sessions", searchHello.results.every((row) => row.key !== "agent:main:web-self-search"), "filtering");
 addCase(cases, "search groups duplicates by session", searchHello.results.length <= searchHello.count, "usability");
@@ -400,6 +424,33 @@ const multiKeywordRanking = await callMethod(methods, "session-search.search", {
 });
 addCase(cases, "multi keyword ranks combined match first", multiKeywordRanking.results[0]?.key === "agent:main:manual-keyword-session", "manual-regression");
 
+const metadataTitleResult = await callMethod(methods, "session-search.search", {
+  query: "保持心态轻松",
+  agentId: "main",
+  limit: 5,
+  sinceDays: 3650,
+  maxSessions: 5000,
+  maxFiles: 5000,
+});
+const metadataTitleRow = metadataTitleResult.results.find((row) => row.key === "agent:main:metadata-title-session");
+addCase(cases, "metadata title result keeps key", metadataTitleRow?.key === "agent:main:metadata-title-session", "display");
+addCase(cases, "metadata title exposes metadataMatches", metadataTitleRow?.metadataMatches?.some((item) => item.field === "title" && item.value === "保持心态轻松"), "display");
+addCase(cases, "metadata title avoids raw metadata blob", !String(metadataTitleRow?.snippet || "").includes("agent:main:"), "experience");
+
+const contextResult = await callMethod(methods, "session-search.search", {
+  query: "foo.bar(baz)",
+  agentId: "main",
+  limit: 5,
+  sinceDays: 3650,
+  maxSessions: 5000,
+  maxFiles: 5000,
+  contextBefore: 1,
+  contextAfter: 1,
+});
+const contextRow = contextResult.results.find((row) => row.key === "agent:main:manual-keyword-session");
+addCase(cases, "content hit exposes context", Array.isArray(contextRow?.hits?.[0]?.context?.before), "display");
+addCase(cases, "content hit context has prior message", contextRow?.hits?.[0]?.context?.before?.some((item) => String(item.text || "").includes("google")), "display");
+
 for (let i = 0; i < 70; i += 1) {
   const result = await callMethod(methods, "session-search.search", {
     query: i % 2 === 0 ? "ordinary" : "keyword",
@@ -471,8 +522,8 @@ for (let i = 0; i < 16; i += 1) {
 const totalMs = performance.now() - t0;
 addCase(cases, "total e2e reports elapsed time", totalMs > 0, "performance");
 
-if (cases.length !== 174) {
-  throw new Error(`FAIL expected 174 cases, got ${cases.length}`);
+if (cases.length !== 182) {
+  throw new Error(`FAIL expected 182 cases, got ${cases.length}`);
 }
 
 const byCategory = cases.reduce((acc, item) => {

@@ -99,6 +99,30 @@
       "includeInternal": {
         "type": "boolean",
         "default": false
+      },
+      "maxHitsPerSession": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10,
+        "default": 2
+      },
+      "contextBefore": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 1
+      },
+      "contextAfter": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 5,
+        "default": 1
+      },
+      "contextMaxChars": {
+        "type": "integer",
+        "minimum": 80,
+        "maximum": 2000,
+        "default": 500
       }
     }
   }

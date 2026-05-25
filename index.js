@@ -23,6 +23,10 @@ const DEFAULTS = {
   includeCron: false,
   includeSubagents: false,
   includeInternal: false,
+  maxHitsPerSession: 2,
+  contextBefore: 1,
+  contextAfter: 1,
+  contextMaxChars: 500,
 };
 
 const SEARCHABLE_ROLES = new Set(["user", "assistant", "system"]);
@@ -37,6 +41,16 @@ const LOW_SIGNAL_HAN_TERMS = new Set([
   "与",
   "及",
   "未",
+]);
+const TERM_EQUIVALENTS = new Map([
+  ["会话", ["session"]],
+  ["搜索", ["search"]],
+  ["检索", ["search"]],
+  ["结果", ["result", "results"]],
+  ["上下文", ["context"]],
+  ["标题", ["title"]],
+  ["助手", ["assistant"]],
+  ["用户", ["user"]],
 ]);
 
 function createJiebaSegmenter() {
@@ -100,6 +114,10 @@ function resolveConfig(raw) {
       typeof cfg.includeSubagents === "boolean" ? cfg.includeSubagents : DEFAULTS.includeSubagents,
     includeInternal:
       typeof cfg.includeInternal === "boolean" ? cfg.includeInternal : DEFAULTS.includeInternal,
+    maxHitsPerSession: clampInt(cfg.maxHitsPerSession, DEFAULTS.maxHitsPerSession, 1, 10),
+    contextBefore: clampInt(cfg.contextBefore, DEFAULTS.contextBefore, 0, 5),
+    contextAfter: clampInt(cfg.contextAfter, DEFAULTS.contextAfter, 0, 5),
+    contextMaxChars: clampInt(cfg.contextMaxChars, DEFAULTS.contextMaxChars, 80, 2000),
   };
 }
 
@@ -121,13 +139,32 @@ function sessionsDirForAgent(agentId) {
 }
 
 function configuredAgentIds() {
+  return configuredAgentEntries().map((agent) => agent.id);
+}
+
+function configuredAgentEntries() {
   const configPath = path.join(stateRoot(), "openclaw.json");
   const config = safeReadJson(configPath);
   const agents = Array.isArray(config.agents?.list) ? config.agents.list : [];
-  const ids = agents
-    .map((agent) => normalizeAgentId(agent?.id))
-    .filter((agentId) => fs.existsSync(sessionsDirForAgent(agentId)));
-  return Array.from(new Set(ids.length > 0 ? ids : ["main"]));
+  const entries = agents
+    .map((agent) => {
+      const id = normalizeAgentId(agent?.id);
+      const name = typeof agent?.name === "string" && agent.name.trim() ? agent.name.trim() : id;
+      return { id, name };
+    })
+    .filter((agent) => fs.existsSync(sessionsDirForAgent(agent.id)));
+  const deduped = [];
+  const seen = new Set();
+  for (const entry of entries.length > 0 ? entries : [{ id: "main", name: "main" }]) {
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+function agentNameForId(agentId) {
+  return configuredAgentEntries().find((agent) => agent.id === normalizeAgentId(agentId))?.name || normalizeAgentId(agentId);
 }
 
 function readJson(filePath) {
@@ -381,6 +418,30 @@ function readTranscriptSummary(sessionFile, maxChars = 96) {
   return empty;
 }
 
+function readSearchableTranscriptMessages(sessionFile, opts = {}) {
+  if (!sessionFile || !fs.existsSync(sessionFile)) return [];
+  try {
+    const stat = fs.statSync(sessionFile);
+    const readBytes = Math.min(stat.size, opts.maxTranscriptBytes || stat.size);
+    const fd = fs.openSync(sessionFile, "r");
+    const buffer = Buffer.alloc(readBytes);
+    fs.readSync(fd, buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
+    fs.closeSync(fd);
+    return buffer
+      .toString("utf8")
+      .split(/\r?\n/)
+      .map((line, index) => ({ msg: line.trim() ? parseTranscriptLine(line) : null, line: index + 1 }))
+      .filter(({ msg }) => {
+        if (!msg || !SEARCHABLE_ROLES.has(msg.role)) return false;
+        if (!opts.includeAssistant && msg.role === "assistant") return false;
+        if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) return false;
+        return true;
+      });
+  } catch {
+    return [];
+  }
+}
+
 function splitScriptRuns(text) {
   return String(text ?? "")
     .match(/[\p{Script=Han}]+|[\p{Script=Latin}\p{N}_-]+|[^\s\p{L}\p{N}]+/gu) ?? [];
@@ -436,12 +497,26 @@ function uniqueTerms(items) {
   return Array.from(new Set(items.map(normalizeTerm).filter(Boolean)));
 }
 
+function equivalentTerms(term) {
+  const normalized = normalizeTerm(term);
+  const direct = [normalized, ...(TERM_EQUIVALENTS.get(normalized) || [])];
+  return uniqueTerms([...direct, ...separatorVariants(direct)]);
+}
+
+function includesTermOrEquivalent(lowerText, term) {
+  return equivalentTerms(term).some((candidate) => lowerText.includes(candidate));
+}
+
 function isHanOnly(value) {
   return /^[\p{Script=Han}]+$/u.test(value);
 }
 
 function hasHan(value) {
   return /[\p{Script=Han}]/u.test(value);
+}
+
+function hasLatin(value) {
+  return /[a-z]/i.test(value);
 }
 
 function isLatinOnly(value) {
@@ -508,14 +583,15 @@ function buildQueryPlan(text) {
     .map(normalizeTerm)
     .filter((term) => isMeaningfulTerm(term, raw));
   const semanticTokens = segmentedTokens.length > 0 ? segmentedTokens : fallbackTokens;
+  const equivalentTokens = semanticTokens.flatMap((term) => equivalentTerms(term).slice(1));
   const timeTokens = normalizeTimeLikeTokens(raw).map((item) => item.toLowerCase());
   const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...semanticTokens, ...timeTokens, ...symbolTokens];
+  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...semanticTokens, ...equivalentTokens, ...timeTokens, ...symbolTokens];
   const terms = uniqueTerms([...baseTokens, ...separatorVariants(baseTokens)]);
   const meaningfulTerms = uniqueTerms(semanticTokens.filter((term) => isMeaningfulTerm(term, raw)));
-  const requiredTermMatches = minRequiredTermMatches(meaningfulTerms.length);
+  const requiredTermMatches = hasHan(raw) && hasLatin(raw) ? 1 : minRequiredTermMatches(meaningfulTerms.length);
   return {
     raw,
     rawLower,
@@ -536,7 +612,7 @@ function acceptMatch(lowerText, plan, match) {
 
   const meaningfulTerms = plan.meaningfulTerms ?? [];
   if (meaningfulTerms.length === 0) return false;
-  const matchedMeaningfulTerms = meaningfulTerms.filter((term) => lowerText.includes(term));
+  const matchedMeaningfulTerms = meaningfulTerms.filter((term) => includesTermOrEquivalent(lowerText, term));
   return matchedMeaningfulTerms.length >= plan.requiredTermMatches;
 }
 
@@ -667,6 +743,7 @@ function searchTranscriptNode(session, queryPlan, opts) {
     hits.push({
       score,
       matchedTerms: match.matchedTerms,
+      hitType: "content",
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -778,6 +855,7 @@ function parseRgMatches(stdout, sessionByFile, queryPlan, opts) {
     hits.push({
       score,
       matchedTerms: match.matchedTerms,
+      hitType: "content",
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -848,6 +926,8 @@ function buildSearchText(session, msg) {
     msg.text,
     session.key,
     session.label,
+    session.agentName,
+    session.agentId,
     session.sessionId,
     formatSearchTimestamp(msg.timestamp),
     formatSearchTimestamp(session.createdAt),
@@ -862,6 +942,8 @@ function buildSessionMetadataSearchText(session) {
     session.key,
     session.label,
     session.displayName,
+    session.agentName,
+    session.agentId,
     session.sessionId,
     formatSearchTimestamp(session.createdAt),
     formatSearchTimestamp(session.lastMessageAt),
@@ -871,12 +953,35 @@ function buildSessionMetadataSearchText(session) {
     .join("\n");
 }
 
+function buildSessionMetadataFields(session) {
+  return [
+    { field: "key", value: session.key },
+    { field: "title", value: session.label || session.displayName },
+    { field: "sessionId", value: session.sessionId },
+    { field: "agentName", value: session.agentName },
+    { field: "agentId", value: session.agentId },
+    { field: "createdAt", value: formatSearchTimestamp(session.createdAt) },
+    { field: "lastMessageAt", value: formatSearchTimestamp(session.lastMessageAt) },
+    { field: "updatedAt", value: formatSearchTimestamp(session.updatedAt) },
+  ].filter((item) => item.value);
+}
+
+function metadataMatchesForSession(session, queryPlan) {
+  return buildSessionMetadataFields(session)
+    .filter((item) => matchText(String(item.value), queryPlan).score > 0)
+    .map((item) => ({ field: item.field, value: singleLine(item.value, 160) }));
+}
+
 function searchSessionMetadata(session, queryPlan, opts) {
   const match = matchText(buildSessionMetadataSearchText(session), queryPlan);
   if (match.score <= 0) return null;
+  const metadataMatches = metadataMatchesForSession(session, queryPlan);
+  const firstMatch = metadataMatches[0];
   return {
     score: match.score,
     matchedTerms: match.matchedTerms,
+    hitType: "metadata",
+    metadataMatches,
     key: session.key,
     label: session.label,
     sessionId: session.sessionId,
@@ -886,8 +991,19 @@ function searchSessionMetadata(session, queryPlan, opts) {
     role: "system",
     line: 0,
     timestamp: session.lastMessageAt || session.updatedAt || session.createdAt,
-    snippet: snippet(buildSessionMetadataSearchText(session), queryPlan.terms, opts.maxChars),
+    snippet: firstMatch ? `${metadataFieldLabel(firstMatch.field)}：${firstMatch.value}` : session.lastMessagePreview || session.displayName || session.sessionId,
   };
+}
+
+function metadataFieldLabel(field) {
+  if (field === "title") return "标题匹配";
+  if (field === "agentName") return "Agent 匹配";
+  if (field === "agentId") return "Agent ID 匹配";
+  if (field === "sessionId") return "Session ID 匹配";
+  if (field === "createdAt") return "创建时间匹配";
+  if (field === "lastMessageAt") return "最近交流时间匹配";
+  if (field === "updatedAt") return "更新时间匹配";
+  return "元数据匹配";
 }
 
 function formatSearchTimestamp(value) {
@@ -961,6 +1077,9 @@ function groupHitsBySession(hits, maxHitsPerSession = 2) {
       group = {
         key,
         label: hit.label,
+        agentId: hit.agentId,
+        agentName: hit.agentName,
+        displayName: hit.displayName,
         sessionId: hit.sessionId,
         updatedAt: hit.updatedAt,
         createdAt: hit.createdAt,
@@ -1028,6 +1147,91 @@ function roleLabel(role) {
   if (role === "assistant") return "助手";
   if (role === "system") return "系统";
   return role || "未知";
+}
+
+function publicHit(hit, session, opts) {
+  const result = {
+    hitType: hit.hitType || "content",
+    role: hit.role,
+    line: hit.line,
+    timestamp: hit.timestamp,
+    snippet: cleanDisplaySnippet(hit.snippet, opts.query),
+  };
+  if (hit.hitType === "content") {
+    result.context = hit.context || buildHitContext(session, hit, opts);
+  }
+  return result;
+}
+
+function buildHitContext(session, hit, opts) {
+  const beforeCount = Math.max(0, Number(opts.contextBefore || 0));
+  const afterCount = Math.max(0, Number(opts.contextAfter || 0));
+  if (hit.hitType !== "content" || (beforeCount === 0 && afterCount === 0)) {
+    return { before: [], after: [] };
+  }
+  const messages = readSearchableTranscriptMessages(session.sessionFile, opts);
+  const index = messages.findIndex((item) => item.line === hit.line);
+  if (index < 0) return { before: [], after: [] };
+  const toContextItem = ({ msg }) => ({
+    role: msg.role,
+    text: singleLine(msg.text, opts.contextMaxChars),
+  });
+  return {
+    before: messages.slice(Math.max(0, index - beforeCount), index).map(toContextItem),
+    after: messages.slice(index + 1, index + 1 + afterCount).map(toContextItem),
+  };
+}
+
+function buildSessionResult(group, sessionsByKey, opts) {
+  const session = sessionsByKey.get(group.key) || {};
+  const contentHits = group.hits.filter((hit) => hit.hitType !== "metadata");
+  const metadataHits = group.hits.filter((hit) => hit.hitType === "metadata");
+  const publicHits = contentHits.slice(0, opts.maxHitsPerSession).map((hit) => publicHit(hit, session, opts));
+  const metadataMatches = uniqueMetadataMatches(
+    metadataHits.flatMap((hit) => hit.metadataMatches || []),
+  );
+  const bestContentHit = contentHits[0];
+  const fallbackSnippet =
+    session.lastMessagePreview ||
+    metadataHits[0]?.snippet ||
+    group.bestHit?.snippet ||
+    group.label ||
+    group.sessionId ||
+    group.key;
+  const snippetText = bestContentHit
+    ? cleanDisplaySnippet(bestContentHit.snippet, opts.query)
+    : cleanDisplaySnippet(fallbackSnippet, opts.query);
+  return {
+    key: group.key,
+    label: group.label,
+    agentId: group.agentId || session.agentId,
+    agentName: session.agentName || group.agentName || group.agentId || session.agentId || "main",
+    displayName: group.displayName || group.label || group.key || group.sessionId || "session",
+    title: group.displayName || group.label || group.key || group.sessionId || "session",
+    sessionId: group.sessionId,
+    updatedAt: group.updatedAt,
+    createdAt: group.createdAt,
+    lastMessageAt: group.lastMessageAt,
+    snippet: snippetText,
+    hitCount: group.hitCount,
+    hits: publicHits,
+    metadataMatches,
+  };
+}
+
+function uniqueMetadataMatches(matches) {
+  const seen = new Set();
+  const result = [];
+  for (const match of matches) {
+    const field = String(match?.field || "");
+    const value = singleLine(match?.value || "", 160);
+    if (!field || !value) continue;
+    const key = `${field}\u0000${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ field, value });
+  }
+  return result;
 }
 
 function cleanDisplaySnippet(value, query) {
@@ -1130,6 +1334,10 @@ async function sessionSearch(params, cfg) {
   const sinceDays = clampInt(params.sinceDays, cfg.sinceDays, 0, 3650);
   const timeoutMs = clampInt(params.timeoutMs, cfg.timeoutMs, 100, 60000);
   const rgBatchSize = clampInt(params.rgBatchSize, cfg.rgBatchSize, 1, 500);
+  const maxHitsPerSession = clampInt(params.maxHitsPerSession, cfg.maxHitsPerSession, 1, 10);
+  const contextBefore = clampInt(params.contextBefore, cfg.contextBefore, 0, 5);
+  const contextAfter = clampInt(params.contextAfter, cfg.contextAfter, 0, 5);
+  const contextMaxChars = clampInt(params.contextMaxChars, cfg.contextMaxChars, 80, 2000);
   const includeCron = typeof params.includeCron === "boolean" ? params.includeCron : cfg.includeCron;
   const includeSubagents =
     typeof params.includeSubagents === "boolean" ? params.includeSubagents : cfg.includeSubagents;
@@ -1139,6 +1347,7 @@ async function sessionSearch(params, cfg) {
     typeof params.includeAssistant === "boolean"
       ? params.includeAssistant
       : cfg.includeAssistantByDefault;
+  const agentName = agentNameForId(agentId);
   const queryPlan = buildQueryPlan(query);
   if (queryPlan.terms.length === 0) throw new Error("query has no searchable terms");
   const listed = listSessionEntries(agentId, {
@@ -1153,7 +1362,10 @@ async function sessionSearch(params, cfg) {
     maxFiles,
     sessionsDir: sessionsDirForAgent(agentId),
   });
-  const selectedSessions = attachTranscriptSummaries(selected.sessions);
+  const selectedSessions = attachTranscriptSummaries(
+    selected.sessions.map((session) => ({ ...session, agentId, agentName })),
+  );
+  const sessionsByKey = new Map(selectedSessions.map((session) => [session.key, session]));
   const searchOpts = {
     limit,
     includeAssistant,
@@ -1161,6 +1373,10 @@ async function sessionSearch(params, cfg) {
     maxTranscriptBytes,
     timeoutMs,
     rgBatchSize,
+    contextBefore,
+    contextAfter,
+    contextMaxChars,
+    maxHitsPerSession,
     excludePluginOutputs: cfg.excludePluginOutputs,
   };
   let search =
@@ -1183,7 +1399,9 @@ async function sessionSearch(params, cfg) {
         Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
           Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
     );
-  const sessionGroups = groupHitsBySession(sortedHits).sort(compareSessionGroups).slice(0, limit);
+  const rankedGroups = groupHitsBySession(sortedHits, Math.max(maxHitsPerSession, 10))
+    .sort(compareSessionGroups)
+    .slice(0, limit);
   return {
     query,
     agentId,
@@ -1203,22 +1421,29 @@ async function sessionSearch(params, cfg) {
     sinceDays,
     maxTranscriptBytes,
     tookMs: Date.now() - startedAt,
-    count: sessionGroups.length,
+    count: rankedGroups.length,
     hitCount: sortedHits.length,
-    results: sessionGroups.map((group) => ({
-      key: group.key,
-      label: group.label,
-      agentId,
-      displayName: group.label || group.key || group.sessionId || "session",
-      sessionId: group.sessionId,
-      updatedAt: group.updatedAt,
-      createdAt: group.createdAt,
-      lastMessageAt: group.lastMessageAt,
-      hitCount: group.hitCount,
-      hits: group.hits,
-    })),
-    sessionGroupCount: sessionGroups.length,
-    sessionGroups,
+    results: rankedGroups.map((group) =>
+      buildSessionResult(
+        {
+          ...group,
+          agentId,
+          agentName,
+          displayName: group.label || group.key || group.sessionId || "session",
+        },
+        sessionsByKey,
+        {
+          query,
+          includeAssistant,
+          excludePluginOutputs: cfg.excludePluginOutputs,
+          maxTranscriptBytes,
+          contextBefore,
+          contextAfter,
+          contextMaxChars,
+          maxHitsPerSession,
+        },
+      ),
+    ),
     debug: {
       ...search.meta,
       stderr: search.meta.stderr || undefined,
@@ -1245,20 +1470,12 @@ async function sessionSearchAllAgents(params, cfg) {
       ),
     ),
   );
-  const mergedGroups = results
-    .flatMap((result) =>
-      (Array.isArray(result.sessionGroups) ? result.sessionGroups : []).map((group) => ({
-        ...group,
-        agentId: result.agentId,
-        displayName: group.displayName || group.label || group.key || group.sessionId || "session",
-        hits: Array.isArray(group.hits)
-          ? group.hits.map((hit) => ({ ...hit, agentId: result.agentId }))
-          : [],
-      })),
-    )
+  const mergedResults = results
+    .flatMap((result) => (Array.isArray(result.results) ? result.results : []))
     .sort(
       (a, b) =>
-        compareSessionGroups(a, b),
+        Number(b.hitCount || 0) - Number(a.hitCount || 0) ||
+        Number(b.lastMessageAt || b.updatedAt || 0) - Number(a.lastMessageAt || a.updatedAt || 0),
     )
     .slice(0, limit);
   const backends = Array.from(new Set(results.map((result) => result.backend).filter(Boolean)));
@@ -1290,22 +1507,9 @@ async function sessionSearchAllAgents(params, cfg) {
       2 * 1024 * 1024,
     ),
     tookMs: Date.now() - startedAt,
-    count: mergedGroups.length,
+    count: mergedResults.length,
     hitCount: results.reduce((sum, result) => sum + Number(result.hitCount || 0), 0),
-    results: mergedGroups.map((group) => ({
-      key: group.key,
-      label: group.label,
-      agentId: group.agentId,
-      displayName: group.displayName,
-      sessionId: group.sessionId,
-      updatedAt: group.updatedAt,
-      createdAt: group.createdAt,
-      lastMessageAt: group.lastMessageAt,
-      hitCount: group.hitCount,
-      hits: group.hits,
-    })),
-    sessionGroupCount: mergedGroups.length,
-    sessionGroups: mergedGroups,
+    results: mergedResults,
     debug: {
       agents: results.map((result) => ({
         agentId: result.agentId,
@@ -1367,6 +1571,10 @@ export default definePluginEntry({
               sinceDays: { type: "number", description: "Only search sessions updated within N days." },
               timeoutMs: { type: "number", description: "Per-rg-batch timeout in milliseconds." },
               maxChars: { type: "number", description: "Maximum snippet chars." },
+              maxHitsPerSession: { type: "number", description: "Maximum content hits per session." },
+              contextBefore: { type: "number", description: "Visible transcript messages before each hit." },
+              contextAfter: { type: "number", description: "Visible transcript messages after each hit." },
+              contextMaxChars: { type: "number", description: "Maximum chars per context message." },
               maxTranscriptBytes: {
                 type: "number",
                 description: "Maximum bytes to scan from the tail of each transcript.",

@@ -91,6 +91,10 @@ assertCase(cases, "filtering", "search filters subagents by default", searchHell
 assertCase(cases, "filtering", "search filters cron by default", searchHello.filteredCron >= 0);
 assertCase(cases, "usability", "search groups hits per session", helloResults.every((row) => Array.isArray(row.hits) && row.hits.length <= 2));
 assertCase(cases, "usability", "search exposes hit counts", helloResults.every((row) => Number(row.hitCount) >= row.hits.length));
+assertCase(cases, "display", "search exposes required result fields", helloResults.every((row) => row.key && row.sessionId && row.agentId && row.agentName && row.title && row.snippet));
+assertCase(cases, "display", "search exposes metadata match arrays", helloResults.every((row) => Array.isArray(row.metadataMatches)));
+assertCase(cases, "display", "search omits legacy sessionGroups", !Object.hasOwn(searchHello, "sessionGroups") && !Object.hasOwn(searchHello, "sessionGroupCount"));
+assertCase(cases, "display", "search omits target by default", helloResults.every((row) => !Object.hasOwn(row, "target")));
 assertCase(cases, "performance", "hello search under 20s", searchHelloTimed.ms < 20000, {
   ms: Math.round(searchHelloTimed.ms),
 });
@@ -129,6 +133,7 @@ for (const result of helloResults) {
   assertCase(cases, "display", `search hit role ${result.key}`, result.hits.every((hit) => ["user", "assistant", "system"].includes(hit.role)));
   assertCase(cases, "display", `search hit timestamp ${result.key}`, result.hits.every((hit) => validTime(hit.timestamp)));
   assertCase(cases, "display", `search hit snippet ${result.key}`, result.hits.every((hit) => hasText(hit.snippet)));
+  assertCase(cases, "display", `search hit context ${result.key}`, result.hits.every((hit) => Array.isArray(hit.context?.before) && Array.isArray(hit.context?.after)));
   assertCase(cases, "experience", `search hit snippet readable ${result.key}`, result.hits.every((hit) => hit.snippet.length <= 260));
   assertCase(cases, "functional", `search grouped session ${result.key}`, Number(result.hits.length) <= 2);
 }
@@ -173,29 +178,29 @@ for (const sinceDays of [0, 2, 3650]) {
   assertCase(cases, "reliability", `sinceDays result shape ${sinceDays}`, Array.isArray(result.results));
 }
 
-let fillerIndex = 0;
-const reusableSessions = sessions.length > 0 ? sessions : [{ key: "none", displayName: "none" }];
+const reusableSessions = helloResults.length > 0 ? helloResults : [{ key: "none", displayName: "none", title: "none" }];
 const reusableSearch = helloResults.length > 0 ? helloResults : [{ key: "none", snippet: "none", timestamp: 1, lastMessageAt: 1 }];
+let fillerIndex = 0;
 while (cases.length < TARGET_CASES) {
   const slot = fillerIndex % 12;
   const session = reusableSessions[fillerIndex % reusableSessions.length];
   const hit = reusableSearch[fillerIndex % reusableSearch.length];
   if (slot === 0) {
-    assertCase(cases, "display", `repeat session key stable ${fillerIndex}`, sessions.length === 0 || isSessionKey(session.key));
+    assertCase(cases, "display", `repeat session key stable ${fillerIndex}`, helloResults.length === 0 || isSessionKey(session.key));
   } else if (slot === 1) {
-    assertCase(cases, "display", `repeat session display stable ${fillerIndex}`, hasText(session.displayName));
+    assertCase(cases, "display", `repeat session display stable ${fillerIndex}`, hasText(session.displayName || session.title));
   } else if (slot === 2) {
-    assertCase(cases, "usability", `repeat session resumable ${fillerIndex}`, sessions.length === 0 || isSessionKey(session.key));
+    assertCase(cases, "usability", `repeat session resumable ${fillerIndex}`, helloResults.length === 0 || isSessionKey(session.key));
   } else if (slot === 3) {
-    assertCase(cases, "experience", `repeat preview compact ${fillerIndex}`, !session.lastMessagePreview || session.lastMessagePreview.length <= 140);
+    assertCase(cases, "experience", `repeat preview compact ${fillerIndex}`, !session.snippet || session.snippet.length <= 140);
   } else if (slot === 4) {
-    assertCase(cases, "functional", `repeat search key known ${fillerIndex}`, helloResults.length === 0 || sessions.some((row) => row.key === hit.key));
+    assertCase(cases, "functional", `repeat search key known ${fillerIndex}`, helloResults.length === 0 || helloResults.some((row) => row.key === hit.key));
   } else if (slot === 5) {
     assertCase(cases, "display", `repeat search snippet ${fillerIndex}`, hasText(hit.snippet));
   } else if (slot === 6) {
-    assertCase(cases, "reliability", `repeat search timestamp ${fillerIndex}`, validTime(hit.timestamp));
+    assertCase(cases, "reliability", `repeat search timestamp ${fillerIndex}`, validTime(hit.lastMessageAt));
   } else if (slot === 7) {
-    assertCase(cases, "functional", `repeat search last time ${fillerIndex}`, hit.timestamp <= hit.lastMessageAt);
+    assertCase(cases, "functional", `repeat search last time ${fillerIndex}`, !hit.updatedAt || hit.updatedAt <= Date.now());
   } else if (slot === 8) {
     assertCase(cases, "large-data", `repeat searched files bounded ${fillerIndex}`, searchHello.searchedFiles <= 5000);
   } else if (slot === 9) {
@@ -203,7 +208,7 @@ while (cases.length < TARGET_CASES) {
   } else if (slot === 10) {
     assertCase(cases, "performance", `repeat search reported took ms ${fillerIndex}`, searchHello.tookMs < 5000);
   } else {
-    assertCase(cases, "live", `repeat gateway data available or empty ${fillerIndex}`, Array.isArray(sessions) && Array.isArray(helloResults));
+    assertCase(cases, "live", `repeat gateway data available or empty ${fillerIndex}`, Array.isArray(helloResults));
   }
   fillerIndex += 1;
 }
@@ -233,7 +238,6 @@ console.log(
       liveOnly: true,
       byCategory,
       liveData: {
-        sessions: sessions.length,
         helloResults: helloResults.length,
         searchBackend: searchHello.backend,
         searchedFiles: searchHello.searchedFiles,
