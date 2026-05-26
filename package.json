@@ -1,6 +1,6 @@
 {
-  "name": "openclaw-session-search",
-  "version": "0.1.0",
+  "name": "session-search",
+  "version": "0.2.2",
   "private": false,
   "type": "module",
   "description": "OpenClaw plugin for deterministic rg-backed session transcript search.",
@@ -9,7 +9,7 @@
     "index.js",
     "openclaw.plugin.json",
     "README.md",
-    "scripts/install.sh"
+    "scripts/install-v2.sh"
   ],
   "scripts": {
     "check": "node --check index.js"
@@ -21,6 +21,9 @@
     "ripgrep"
   ],
   "license": "MIT",
+  "dependencies": {
+    "@node-rs/jieba": "^2.0.1"
+  },
   "peerDependencies": {
     "openclaw": "*"
   },

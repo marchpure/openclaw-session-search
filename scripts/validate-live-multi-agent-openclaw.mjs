@@ -8,7 +8,8 @@ const execFileAsync = promisify(execFile);
 const OPENCLAW_HOME = process.env.OPENCLAW_HOME || "/root/.openclaw";
 const PROJECT_ROOT = path.join(OPENCLAW_HOME, ".arkclaw-team", "projects", "project-1");
 const DEFAULT_CASES = 1000;
-const AGENTS = ["ai-1111", "ai-2222", "ai-3333", "ai-4444", "ai-5555"];
+const RUN_ID = process.env.OPENCLAW_SESSION_SEARCH_LIVE_RUN_ID || `validation-${process.pid}`;
+const AGENTS = Array.from({ length: 5 }, (_, index) => `session-search-${RUN_ID}-${index + 1}`);
 const TOPIC_COUNT = 30;
 
 function parseArgs() {
@@ -24,6 +25,7 @@ function parseArgs() {
       .split(",")
       .map((item) => item.trim())
       .filter(Boolean),
+    cleanupDefaultAgents: !args.has("agents"),
   };
 }
 
@@ -222,7 +224,6 @@ const start = performance.now();
 let completedQueries = 0;
 
 for (const agentId of options.agents) {
-  await ensureAgent(agentId);
   installFixture(agentId);
 }
 
@@ -260,11 +261,11 @@ async function runQueryCase(i) {
   assertCase(cases, "live", `gateway result shape ${i}`, Array.isArray(result.results));
   assertCase(cases, "performance", `gateway call under 120s ${i}`, ms < 120000, { ms });
   assertCase(cases, "filtering", `hidden sessions filtered ${i}`, result.filteredCron >= 1 && result.filteredSubagent >= 1 && result.filteredTool >= 1, result);
-  assertCase(cases, "experience", `sessionGroups exists ${i}`, Array.isArray(result.sessionGroups) && typeof result.sessionGroupCount === "number", result);
-  assertCase(cases, "experience", `sessionGroups bounded ${i}`, result.sessionGroupCount <= 50, result);
+  assertCase(cases, "experience", `legacy sessionGroups omitted ${i}`, !Object.hasOwn(result, "sessionGroups") && !Object.hasOwn(result, "sessionGroupCount"), result);
+  assertCase(cases, "experience", `results bounded ${i}`, result.results.length <= 50 && result.count === result.results.length, result);
 
   if (query === "not-exist-live-openclaw-zzzz") {
-    assertCase(cases, "functional", `no result query ${i}`, result.count === 0 && result.sessionGroupCount === 0, result);
+    assertCase(cases, "functional", `no result query ${i}`, result.count === 0 && result.results.length === 0, result);
     return;
   }
 
@@ -278,14 +279,16 @@ async function runQueryCase(i) {
   assertCase(
     cases,
     "experience",
-    `group shape ${i}`,
-    result.sessionGroups.every((group) => group.key && group.bestHit?.snippet && group.hitCount >= 1),
-    result.sessionGroups[0],
+    `result shape ${i}`,
+    result.results.every((row) => row.key && row.sessionId && row.agentId && row.agentName && row.title && row.snippet && row.hitCount >= 1 && Array.isArray(row.hits)),
+    result.results[0],
   );
+  assertCase(cases, "experience", `no target by default ${i}`, result.results.every((row) => !Object.hasOwn(row, "target")), result.results[0]);
+  assertCase(cases, "experience", `metadata matches array ${i}`, result.results.every((row) => Array.isArray(row.metadataMatches)), result.results[0]);
   if (query === "live-openclaw" || query === "multi-session-real-gateway") {
     assertCase(cases, "functional", `multi-session recall ${i}`, uniqueKeys(result.results).size >= 20, {
       count: result.count,
-      groups: result.sessionGroupCount,
+      results: result.results.length,
     });
   }
 }
@@ -316,10 +319,10 @@ for (const agentId of options.agents) {
   });
   timings.push(ms);
   const keys = uniqueKeys(result.results);
-  crossAgentSummary.push({ agentId, count: result.count, sessionGroupCount: result.sessionGroupCount });
+  crossAgentSummary.push({ agentId, count: result.count, resultCount: result.results.length });
   assertCase(cases, "cross-agent", `${agentId} returns own sessions`, result.results.every((row) => row.key.startsWith(`agent:${agentId}:`)), result.results.slice(0, 3));
   assertCase(cases, "cross-agent", `${agentId} has many live sessions`, keys.size >= 20, { keys: keys.size });
-  assertCase(cases, "experience", `${agentId} groups many sessions`, result.sessionGroupCount >= 20, result);
+  assertCase(cases, "experience", `${agentId} returns many sessions`, result.results.length >= 20, result);
 }
 
 const totalMs = performance.now() - start;
@@ -329,6 +332,12 @@ const byCategory = cases.reduce((acc, item) => {
   acc[item.category] = (acc[item.category] || 0) + 1;
   return acc;
 }, {});
+
+if (options.cleanupDefaultAgents) {
+  for (const agentId of options.agents) {
+    fs.rmSync(path.join(OPENCLAW_HOME, "agents", agentId), { recursive: true, force: true });
+  }
+}
 
 console.log(
   JSON.stringify(
@@ -356,7 +365,7 @@ console.log(
         maxGatewayCallMs: Math.round(Math.max(...timings)),
       },
       uxRecommendation:
-        "Render grouped by agentId first, then sessionGroups. Show bestHit and hitCount per session; expand only when the user wants individual hits.",
+        "Render results directly. Use title, agentName, snippet, hits.context, metadataMatches, and key/sessionId/agentId for navigation.",
     },
     null,
     2,

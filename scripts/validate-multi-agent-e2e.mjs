@@ -9,7 +9,10 @@ const workRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-session-search-
 const pluginRoot = path.join(workRoot, "plugin");
 const stateRoot = path.join(workRoot, "state");
 const fakeDistDir = path.join(workRoot, "dist");
-const AGENTS = ["ai-1111", "ai-2222", "ai-3333", "main"];
+const AGENTS = ["a-mpgtowbf5xplok", "ai-2222", "ai-3333", "main"];
+const SCOPED_LABEL_AGENT = "a-mpgtowbf5xplok";
+const SCOPED_LABEL_SESSION_NAME = "web-23771cfd-cf5a-49e8-aca3-4dc20098250c";
+const SCOPED_LABEL_TITLE = "沪市今天的指数";
 const TARGET_CASES = 1000;
 
 function writeJson(file, value) {
@@ -72,6 +75,9 @@ function addSession(store, dir, agentId, name, { label, text, updatedAt, kind = 
 
 function createFixture() {
   const now = Date.now();
+  writeJson(path.join(stateRoot, "openclaw.json"), {
+    agents: { list: AGENTS.map((id) => ({ id, name: id === "main" ? "Main Agent" : `Agent ${id}` })) },
+  });
   for (const agentId of AGENTS) {
     const dir = sessionsDir(agentId);
     fs.mkdirSync(dir, { recursive: true });
@@ -114,6 +120,13 @@ function createFixture() {
       text: "历史会话搜索：project-x",
       updatedAt: now,
     });
+    if (agentId === SCOPED_LABEL_AGENT) {
+      addSession(store, dir, agentId, SCOPED_LABEL_SESSION_NAME, {
+        label: `<agent:${agentId}:${SCOPED_LABEL_SESSION_NAME}>${SCOPED_LABEL_TITLE}`,
+        text: `${SCOPED_LABEL_TITLE} project-x market summary`,
+        updatedAt: now + 1000,
+      });
+    }
     writeJson(path.join(dir, "sessions.json"), store);
   }
 }
@@ -197,16 +210,16 @@ for (let i = 0; i < TARGET_CASES; i += 1) {
   });
   timings.push(performance.now() - t0);
   if (query === "不存在的查询词火星水星木星") {
-    assertCase(cases, "functional", `no-result ${i}`, result.count === 0 && result.sessionGroupCount === 0, result);
+    assertCase(cases, "functional", `no-result ${i}`, result.count === 0 && result.results.length === 0 && !Object.hasOwn(result, "sessionGroups"), result);
     continue;
   }
   assertCase(cases, "functional", `results stay in requested agent ${i}`, result.results.every((row) => row.key.startsWith(`agent:${agentId}:`)), result.results.slice(0, 3));
   assertCase(cases, "filtering", `hidden filtered ${i}`, result.filteredCron === 4 && result.filteredSubagent === 4 && result.filteredTool === 1, result);
-  assertCase(cases, "experience", `session groups are deduped ${i}`, result.sessionGroupCount <= result.count, {
+  assertCase(cases, "experience", `results are deduped ${i}`, uniqueSessionKeys(result.results).length === result.results.length, {
     count: result.count,
-    sessionGroupCount: result.sessionGroupCount,
+    results: result.results.length,
   });
-  assertCase(cases, "experience", `group shape ${i}`, result.sessionGroups.every((group) => group.key && group.hitCount >= 1 && group.bestHit?.snippet), result.sessionGroups[0]);
+  assertCase(cases, "experience", `result shape ${i}`, result.results.every((row) => row.key && row.sessionId && row.agentName && row.snippet && row.hitCount >= 1 && Array.isArray(row.hits)), result.results[0]);
   if (query === "project-x" || query === "shared-topic" || query === "repeated-summary") {
     assertCase(cases, "functional", `many sessions found ${i}`, uniqueSessionKeys(result.results).length >= 10, { query, count: result.count });
   }
@@ -227,6 +240,43 @@ for (const agentId of AGENTS) {
 const grouped = groupByAgent(crossAgentHits);
 assertCase(cases, "cross-agent", "four agent groups present", Object.keys(grouped).length === 4, grouped);
 assertCase(cases, "cross-agent", "each group has at least ten sessions", Object.values(grouped).every((rows) => uniqueSessionKeys(rows).length >= 10), grouped);
+
+const allAgentResult = await callMethod(methods, "session-search.search", {
+  query: "project-x",
+  limit: 50,
+  sinceDays: 3650,
+  maxSessions: 1000,
+  maxFiles: 1000,
+});
+assertCase(cases, "cross-agent", "default search covers configured agents", allAgentResult.agentsSearched.length === AGENTS.length, allAgentResult);
+assertCase(
+  cases,
+  "cross-agent",
+  "all-agent keys keep original session key",
+  allAgentResult.results.every((row) => row.key.startsWith(`agent:${row.agentId}:`) && !row.key.startsWith(`${row.agentId}:`)),
+  allAgentResult.results.slice(0, 3),
+);
+assertCase(
+  cases,
+  "cross-agent",
+  "all-agent result does not add scoped key",
+  allAgentResult.results.every((row) => !Object.hasOwn(row, "agentScopedKey")),
+  allAgentResult.results.slice(0, 3),
+);
+
+const scopedLabelKey = `agent:${SCOPED_LABEL_AGENT}:${SCOPED_LABEL_SESSION_NAME}`;
+const scopedLabelResult = await callMethod(methods, "session-search.search", {
+  query: SCOPED_LABEL_TITLE,
+  limit: 5,
+  sinceDays: 3650,
+  maxSessions: 1000,
+  maxFiles: 1000,
+});
+const scopedLabelRow = scopedLabelResult.results.find((row) => row.key === scopedLabelKey);
+assertCase(cases, "cross-agent", "scoped label result keeps original key", scopedLabelRow?.key === scopedLabelKey, scopedLabelResult.results);
+assertCase(cases, "experience", "scoped label display strips agent wrapper", scopedLabelRow?.displayName === SCOPED_LABEL_TITLE, scopedLabelRow);
+assertCase(cases, "experience", "scoped label exposes title", scopedLabelRow?.title === SCOPED_LABEL_TITLE, scopedLabelRow);
+assertCase(cases, "experience", "all-agent omits legacy sessionGroups", !Object.hasOwn(allAgentResult, "sessionGroups") && !Object.hasOwn(allAgentResult, "sessionGroupCount"), allAgentResult);
 
 const sortedTimings = [...timings].sort((a, b) => a - b);
 const percentile = (p) => Math.round(sortedTimings[Math.min(sortedTimings.length - 1, Math.floor(sortedTimings.length * p))] || 0);
@@ -252,7 +302,7 @@ console.log(
         p95Ms: percentile(0.95),
         maxMs: Math.round(sortedTimings.at(-1) || 0),
       },
-      recommendedUx: "group by agentId, dedupe by session key, render top sessions with hitCount and bestHit, hide overflow behind expand",
+      recommendedUx: "Render the results array directly. Use title, agentName, snippet, hits.context, metadataMatches, and key/sessionId for navigation.",
     },
     null,
     2,

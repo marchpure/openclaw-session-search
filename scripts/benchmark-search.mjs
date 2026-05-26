@@ -171,13 +171,6 @@ const runs = [];
 
 for (const scale of SCALE_SET) {
   createFixture(scale);
-  const resume = await timed(() =>
-    callMethod(methods, "session-search.resume", {
-      agentId: "main",
-      maxSessions: scale,
-      sinceDays: 2,
-    }),
-  );
   const rgNeedle = await timed(() =>
     callMethod(methods, "session-search.search", {
       query: "benchmark needle phrase",
@@ -222,7 +215,6 @@ for (const scale of SCALE_SET) {
   runs.push({
     scale,
     largeFiles: LARGE_FILES,
-    resumeListMs: resume.ms,
     rgNeedleMs: rgNeedle.ms,
     nodeNeedleMs: nodeNeedle.ms,
     zeroHitMs: zeroHit.ms,
