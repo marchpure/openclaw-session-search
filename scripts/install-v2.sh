@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PLUGIN_ID="session-search"
-DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/session-search-0.2.3.tgz"
+DEFAULT_PACKAGE_URL="https://haoxingjun-test.tos-cn-beijing.volces.com/openclaw-session-search/session-search-0.2.4.tgz"
 DEFAULT_REPO_SPEC="https://github.com/marchpure/openclaw-session-search.git#sync/session-search-ui-refresh-marchpure"
 
 if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
@@ -16,6 +16,12 @@ fi
 PACKAGE_URL="${OPENCLAW_SESSION_SEARCH_PACKAGE_URL:-$DEFAULT_PACKAGE_URL}"
 REPO_SPEC="${OPENCLAW_SESSION_SEARCH_REPO_SPEC:-$DEFAULT_REPO_SPEC}"
 SKIP_GATEWAY_RESTART="${OPENCLAW_SESSION_SEARCH_SKIP_GATEWAY_RESTART:-0}"
+
+if ! pwd >/dev/null 2>&1; then
+  cd /tmp
+else
+  cd "${OPENCLAW_STATE_DIR_RESOLVED:-/tmp}" 2>/dev/null || cd /tmp
+fi
 
 log() {
   printf '[openclaw-session-search] %s\n' "$*"
