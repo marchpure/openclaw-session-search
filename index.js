@@ -2,19 +2,20 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
+const require = createRequire(import.meta.url);
+
 const DEFAULTS = {
-  enabled: false,
   backend: "rg",
   fallbackToNode: true,
   defaultLimit: 8,
-  maxSessions: 200,
+  maxSessions: 1000,
   maxCharsPerMessage: 800,
   maxTranscriptBytes: 256 * 1024,
   maxFiles: 1000,
-  sinceDays: 2,
+  sinceDays: 30,
   timeoutMs: 3000,
   rgBatchSize: 200,
   includeAssistantByDefault: true,
@@ -22,9 +23,49 @@ const DEFAULTS = {
   includeCron: false,
   includeSubagents: false,
   includeInternal: false,
+  maxHitsPerSession: 2,
+  contextBefore: 1,
+  contextAfter: 1,
+  contextMaxChars: 500,
 };
 
 const SEARCHABLE_ROLES = new Set(["user", "assistant", "system"]);
+const LOW_SIGNAL_HAN_TERMS = new Set([
+  "的",
+  "了",
+  "在",
+  "是",
+  "到",
+  "和",
+  "或",
+  "与",
+  "及",
+  "未",
+]);
+const TERM_EQUIVALENTS = new Map([
+  ["会话", ["session"]],
+  ["搜索", ["search"]],
+  ["检索", ["search"]],
+  ["结果", ["result", "results"]],
+  ["上下文", ["context"]],
+  ["标题", ["title"]],
+  ["助手", ["assistant"]],
+  ["用户", ["user"]],
+]);
+
+function createJiebaSegmenter() {
+  try {
+    const mod = require("@node-rs/jieba");
+    if (typeof mod?.Jieba === "function") {
+      return new mod.Jieba();
+    }
+  } catch {
+    // Keep the plugin usable when optional native segmentation is unavailable.
+  }
+  return null;
+}
+
+const JIEBA_SEGMENTER = createJiebaSegmenter();
 
 function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -39,7 +80,6 @@ function clampInt(value, fallback, min, max) {
 function resolveConfig(raw) {
   const cfg = asRecord(raw);
   return {
-    enabled: typeof cfg.enabled === "boolean" ? cfg.enabled : DEFAULTS.enabled,
     backend: cfg.backend === "node" ? "node" : DEFAULTS.backend,
     fallbackToNode:
       typeof cfg.fallbackToNode === "boolean" ? cfg.fallbackToNode : DEFAULTS.fallbackToNode,
@@ -74,11 +114,27 @@ function resolveConfig(raw) {
       typeof cfg.includeSubagents === "boolean" ? cfg.includeSubagents : DEFAULTS.includeSubagents,
     includeInternal:
       typeof cfg.includeInternal === "boolean" ? cfg.includeInternal : DEFAULTS.includeInternal,
+    maxHitsPerSession: clampInt(cfg.maxHitsPerSession, DEFAULTS.maxHitsPerSession, 1, 10),
+    contextBefore: clampInt(cfg.contextBefore, DEFAULTS.contextBefore, 0, 5),
+    contextAfter: clampInt(cfg.contextAfter, DEFAULTS.contextAfter, 0, 5),
+    contextMaxChars: clampInt(cfg.contextMaxChars, DEFAULTS.contextMaxChars, 80, 2000),
   };
 }
 
 function nowMs() {
   return Date.now();
+}
+
+export function currentSessionContext(ctx) {
+  const sessionKey = typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+  const sessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId.trim() : "";
+  const agentId = typeof ctx?.agentId === "string" ? ctx.agentId.trim() : "";
+  return {
+    session_id: sessionKey || sessionId,
+    sessionKey: sessionKey || undefined,
+    sessionId: sessionId || undefined,
+    agentId: agentId || undefined,
+  };
 }
 
 function normalizeAgentId(value) {
@@ -92,6 +148,35 @@ function stateRoot() {
 
 function sessionsDirForAgent(agentId) {
   return path.join(stateRoot(), "agents", normalizeAgentId(agentId), "sessions");
+}
+
+function configuredAgentIds() {
+  return configuredAgentEntries().map((agent) => agent.id);
+}
+
+function configuredAgentEntries() {
+  const configPath = path.join(stateRoot(), "openclaw.json");
+  const config = safeReadJson(configPath);
+  const agents = Array.isArray(config.agents?.list) ? config.agents.list : [];
+  const entries = agents
+    .map((agent) => {
+      const id = normalizeAgentId(agent?.id);
+      const name = typeof agent?.name === "string" && agent.name.trim() ? agent.name.trim() : id;
+      return { id, name };
+    })
+    .filter((agent) => fs.existsSync(sessionsDirForAgent(agent.id)));
+  const deduped = [];
+  const seen = new Set();
+  for (const entry of entries.length > 0 ? entries : [{ id: "main", name: "main" }]) {
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    deduped.push(entry);
+  }
+  return deduped;
+}
+
+function agentNameForId(agentId) {
+  return configuredAgentEntries().find((agent) => agent.id === normalizeAgentId(agentId))?.name || normalizeAgentId(agentId);
 }
 
 function readJson(filePath) {
@@ -124,7 +209,7 @@ function stringFromEntry(entry, key) {
 
 function isPluginCommandSession(entry) {
   const label = stringFromEntry(entry, "label");
-  return /^\/(?:session-search|resume)(?:\s|$)/i.test(label);
+  return /^\/session-search(?:\s|$)/i.test(label);
 }
 
 function hasUserVisibleChannel(entry) {
@@ -221,6 +306,11 @@ function listSessionEntries(agentId, opts) {
   return { sessions, stats };
 }
 
+function isIgnoredTranscriptFile(filePath) {
+  const name = path.basename(String(filePath ?? "")).toLowerCase();
+  return /(^|[._-])(reset|delete|deleted)([._-]|$)/.test(name);
+}
+
 function listLegacyTranscriptEntries(dir, indexedSessionIds) {
   if (!fs.existsSync(dir)) return [];
   let names = [];
@@ -230,6 +320,7 @@ function listLegacyTranscriptEntries(dir, indexedSessionIds) {
     return [];
   }
   return names
+    .filter((name) => !isIgnoredTranscriptFile(name))
     .filter((name) => name.endsWith(".jsonl"))
     .filter((name) => !indexedSessionIds.has(path.basename(name, ".jsonl")))
     .map((name) => {
@@ -255,13 +346,6 @@ function listLegacyTranscriptEntries(dir, indexedSessionIds) {
         },
       ];
     });
-}
-
-function parseAgentIdFromSessionKey(key) {
-  const parts = String(key ?? "").split(":");
-  const agentIndex = parts.indexOf("agent");
-  if (agentIndex >= 0 && parts[agentIndex + 1]) return parts[agentIndex + 1];
-  return "main";
 }
 
 function resolveSessionFile(dir, entry) {
@@ -346,71 +430,33 @@ function readTranscriptSummary(sessionFile, maxChars = 96) {
   return empty;
 }
 
-function normalizeSessionLabel(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function parseSessionResumeLabel(raw) {
-  const label = normalizeSessionLabel(raw);
-  if (!label) return { ok: false, error: "请提供要恢复的命名会话。" };
-  if (label.length > 120) return { ok: false, error: "会话名过长，最多 120 个字符。" };
-  if (/[\r\n\t]/.test(label)) return { ok: false, error: "会话名不能包含换行或制表符。" };
-  return { ok: true, label };
-}
-
-function sessionDisplayName(session) {
-  return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
-}
-
-function listResumableSessions(agentId, cfg, params = {}) {
-  const listed = listSessionEntries(agentId, {
-    maxSessions: clampInt(params.maxSessions, 100, 1, cfg.maxSessions),
-    sinceDays: clampInt(params.sinceDays, 3650, 0, 3650),
-    includeCron: false,
-    includeSubagents: false,
-    includeInternal: false,
-  });
-  const sessions = listed.sessions.map((session) => ({
-    ...session,
-    label: normalizeSessionLabel(session.label),
-    displayName: sessionDisplayName(session),
-    ...readTranscriptSummary(session.sessionFile),
-  }));
-  return { sessions, stats: listed.stats };
-}
-
-function resolveResumableSession(agentId, target, cfg) {
-  const { sessions } = listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions });
-  const exact = sessions.filter((session) => session.label === target || session.key === target);
-  if (exact.length === 1) return { ok: true, session: exact[0] };
-  if (exact.length > 1) {
-    return { ok: false, code: "ambiguous", matches: exact };
+function readSearchableTranscriptMessages(sessionFile, opts = {}) {
+  if (!sessionFile || !fs.existsSync(sessionFile)) return [];
+  try {
+    const stat = fs.statSync(sessionFile);
+    const readBytes = Math.min(stat.size, opts.maxTranscriptBytes || stat.size);
+    const fd = fs.openSync(sessionFile, "r");
+    const buffer = Buffer.alloc(readBytes);
+    fs.readSync(fd, buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
+    fs.closeSync(fd);
+    return buffer
+      .toString("utf8")
+      .split(/\r?\n/)
+      .map((line, index) => ({ msg: line.trim() ? parseTranscriptLine(line) : null, line: index + 1 }))
+      .filter(({ msg }) => {
+        if (!msg || !SEARCHABLE_ROLES.has(msg.role)) return false;
+        if (!opts.includeAssistant && msg.role === "assistant") return false;
+        if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) return false;
+        return true;
+      });
+  } catch {
+    return [];
   }
-  const targetLower = target.toLowerCase();
-  const insensitive = sessions.filter(
-    (session) => session.label.toLowerCase() === targetLower || session.key.toLowerCase() === targetLower,
-  );
-  if (insensitive.length === 1) return { ok: true, session: insensitive[0] };
-  if (insensitive.length > 1) {
-    return { ok: false, code: "ambiguous", matches: insensitive };
-  }
-  return { ok: false, code: "not_found", matches: [] };
 }
 
 function splitScriptRuns(text) {
   return String(text ?? "")
     .match(/[\p{Script=Han}]+|[\p{Script=Latin}\p{N}_-]+|[^\s\p{L}\p{N}]+/gu) ?? [];
-}
-
-function hanBigrams(text) {
-  const grams = [];
-  for (const run of String(text ?? "").match(/[\p{Script=Han}]{3,}/gu) ?? []) {
-    const chars = Array.from(run);
-    for (let i = 0; i < chars.length - 1; i += 1) {
-      grams.push(`${chars[i]}${chars[i + 1]}`);
-    }
-  }
-  return grams;
 }
 
 function separatorVariants(tokens) {
@@ -455,8 +501,87 @@ function normalizeTimeLikeTokens(text) {
   return tokens;
 }
 
+function normalizeTerm(value) {
+  return String(value ?? "").toLowerCase().trim();
+}
+
+function uniqueTerms(items) {
+  return Array.from(new Set(items.map(normalizeTerm).filter(Boolean)));
+}
+
+function equivalentTerms(term) {
+  const normalized = normalizeTerm(term);
+  const direct = [normalized, ...(TERM_EQUIVALENTS.get(normalized) || [])];
+  return uniqueTerms([...direct, ...separatorVariants(direct)]);
+}
+
+function includesTermOrEquivalent(lowerText, term) {
+  return equivalentTerms(term).some((candidate) => lowerText.includes(candidate));
+}
+
+function isHanOnly(value) {
+  return /^[\p{Script=Han}]+$/u.test(value);
+}
+
+function hasHan(value) {
+  return /[\p{Script=Han}]/u.test(value);
+}
+
+function hasLatin(value) {
+  return /[a-z]/i.test(value);
+}
+
+function isLatinOnly(value) {
+  return /^[a-z]+$/i.test(value);
+}
+
+function isMeaningfulTerm(term, raw = "") {
+  if (!term) return false;
+  if (/^\s+$/.test(term)) return false;
+  if (/^[^\p{L}\p{N}_-]+$/u.test(term)) return false;
+  if (isHanOnly(term) && (term.length <= 1 || LOW_SIGNAL_HAN_TERMS.has(term))) return false;
+  if (isLatinOnly(term) && term.length <= 2 && !String(raw).includes(term.toUpperCase())) return false;
+  return term.length >= 2 || !isHanOnly(term);
+}
+
+function segmentWithJieba(text) {
+  if (!JIEBA_SEGMENTER) return [];
+  try {
+    return JIEBA_SEGMENTER.cutForSearch(String(text ?? ""), true)
+      .map(normalizeTerm)
+      .filter((term) => isMeaningfulTerm(term, text));
+  } catch {
+    return [];
+  }
+}
+
+function fallbackSegmentTerms(text) {
+  const terms = [];
+  for (const run of splitScriptRuns(text)) {
+    if (isHanOnly(run) && run.length > 2) {
+      for (let index = 0; index < run.length - 1; index += 1) {
+        terms.push(run.slice(index, index + 2));
+      }
+    } else {
+      terms.push(run);
+    }
+  }
+  return terms;
+}
+
 function tokenize(text) {
+  return buildQueryPlan(text).terms;
+}
+
+function minRequiredTermMatches(termCount) {
+  if (termCount <= 1) return termCount;
+  if (termCount === 2) return 2;
+  return Math.max(2, Math.ceil(termCount * 0.7));
+}
+
+function buildQueryPlan(text) {
   const raw = String(text ?? "").trim();
+  const rawLower = raw.toLowerCase();
   const tokens = raw
     .toLowerCase()
     .split(/[^\p{L}\p{N}_-]+/u)
@@ -465,16 +590,47 @@ function tokenize(text) {
   const scriptTokens = splitScriptRuns(raw)
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const hanTokens = hanBigrams(raw);
+  const segmentedTokens = segmentWithJieba(raw);
+  const fallbackTokens = fallbackSegmentTerms(raw)
+    .map(normalizeTerm)
+    .filter((term) => isMeaningfulTerm(term, raw));
+  const semanticTokens = segmentedTokens.length > 0 ? segmentedTokens : fallbackTokens;
+  const equivalentTokens = semanticTokens.flatMap((term) => equivalentTerms(term).slice(1));
   const timeTokens = normalizeTimeLikeTokens(raw).map((item) => item.toLowerCase());
   const symbolTokens = (raw.match(/[^\s\p{L}\p{N}]{2,}|[\w.-]+[()[\]{}:/\\.=+\-*_#@]+[\w()[\]{}:/\\.=+\-*_#@]*/gu) ?? [])
     .map((item) => item.toLowerCase().trim())
     .filter((item) => item.length >= 2);
-  const baseTokens = [raw.toLowerCase(), ...tokens, ...scriptTokens, ...hanTokens, ...timeTokens, ...symbolTokens];
-  return Array.from(new Set([...baseTokens, ...separatorVariants(baseTokens)]));
+  const baseTokens = [rawLower, ...tokens, ...scriptTokens, ...semanticTokens, ...equivalentTokens, ...timeTokens, ...symbolTokens];
+  const terms = uniqueTerms([...baseTokens, ...separatorVariants(baseTokens)]);
+  const meaningfulTerms = uniqueTerms(semanticTokens.filter((term) => isMeaningfulTerm(term, raw)));
+  const requiredTermMatches = hasHan(raw) && hasLatin(raw) ? 1 : minRequiredTermMatches(meaningfulTerms.length);
+  return {
+    raw,
+    rawLower,
+    hasHan: hasHan(raw),
+    terms,
+    rgTerms: terms,
+    meaningfulTerms,
+    requiredTermMatches,
+    allowRawPhrase: meaningfulTerms.length > 0,
+    requireTermCoverage: true,
+  };
 }
 
-function matchText(text, terms) {
+function acceptMatch(lowerText, plan, match) {
+  if (!match || match.score <= 0) return false;
+  if (!plan?.requireTermCoverage) return true;
+  if (plan.allowRawPhrase && plan.rawLower && lowerText.includes(plan.rawLower)) return true;
+
+  const meaningfulTerms = plan.meaningfulTerms ?? [];
+  if (meaningfulTerms.length === 0) return false;
+  const matchedMeaningfulTerms = meaningfulTerms.filter((term) => includesTermOrEquivalent(lowerText, term));
+  return matchedMeaningfulTerms.length >= plan.requiredTermMatches;
+}
+
+function matchText(text, planOrTerms) {
+  const plan = Array.isArray(planOrTerms) ? { terms: planOrTerms } : planOrTerms;
+  const terms = Array.isArray(planOrTerms) ? planOrTerms : planOrTerms?.terms ?? [];
   const lower = text.toLowerCase();
   let score = 0;
   let matchedTerms = 0;
@@ -489,22 +645,18 @@ function matchText(text, terms) {
     }
     if (matched) matchedTerms += 1;
   }
-  return { score: score + Math.max(0, matchedTerms - 1) * 5, matchedTerms };
+  const result = { score: score + Math.max(0, matchedTerms - 1) * 5, matchedTerms };
+  if (!acceptMatch(lower, plan, result)) return { score: 0, matchedTerms };
+  return result;
 }
 
 function isPluginGeneratedTranscriptText(text) {
   const normalized = cleanTranscriptText(text);
   if (!normalized) return false;
   if (/^历史会话搜索：/.test(normalized)) return true;
-  if (/^可恢复会话：/.test(normalized)) return true;
-  if (/^已恢复会话：/.test(normalized)) return true;
-  if (/^恢复会话失败：/.test(normalized)) return true;
   if (/^Session search is disabled\./.test(normalized)) return true;
-  if (/^Session resume is disabled\./.test(normalized)) return true;
-  if (/结果 \d+ 条 \| 可见会话 \d+ 个 \| 过滤 \d+ 个 \| \d+ms \((?:rg|node)\)/.test(normalized)) return true;
+  if (/结果 \d+ 个会话 \| 命中 \d+ 次 \| 可见会话 \d+ 个 \| 过滤 \d+ 个 \| \d+ms \((?:rg|node)\)/.test(normalized)) return true;
   if (normalized.includes("未找到匹配的用户可见会话。")) return true;
-  if (normalized.includes("使用：/resume <会话或恢复ID>")) return true;
-  if (normalized.includes("后续消息会继续进入这个会话。")) return true;
   return false;
 }
 
@@ -526,7 +678,6 @@ function cleanTranscriptText(value) {
   let text = String(value ?? "");
   const metadataMarkers = [
     "\n\n你好",
-    "\n\n/resume",
     "\n\n/session-search",
     "\n\n/status",
   ];
@@ -553,9 +704,14 @@ function searchableSessions(sessions, opts) {
   let skippedMissing = 0;
   let skippedLarge = 0;
   let skippedUnsafePath = 0;
+  let skippedIgnoredTranscript = 0;
   for (const session of sessions) {
     if (!session.sessionFile || !fs.existsSync(session.sessionFile)) {
       skippedMissing += 1;
+      continue;
+    }
+    if (isIgnoredTranscriptFile(session.sessionFile)) {
+      skippedIgnoredTranscript += 1;
       continue;
     }
     if (opts.sessionsDir && !isPathInside(opts.sessionsDir, session.sessionFile)) {
@@ -566,7 +722,7 @@ function searchableSessions(sessions, opts) {
     accepted.push({ ...session, size, tailOnly: size > opts.maxTranscriptBytes });
     if (accepted.length >= opts.maxFiles) break;
   }
-  return { sessions: accepted, skippedMissing, skippedLarge, skippedUnsafePath };
+  return { sessions: accepted, skippedMissing, skippedLarge, skippedUnsafePath, skippedIgnoredTranscript };
 }
 
 function isPathInside(parentDir, childPath) {
@@ -576,7 +732,7 @@ function isPathInside(parentDir, childPath) {
   return relative === "" || Boolean(relative && !relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function searchTranscriptNode(session, terms, opts) {
+function searchTranscriptNode(session, queryPlan, opts) {
   if (!session.sessionFile || !fs.existsSync(session.sessionFile)) return [];
   const stat = fs.statSync(session.sessionFile);
   const fd = fs.openSync(session.sessionFile, "r");
@@ -593,12 +749,13 @@ function searchTranscriptNode(session, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const match = matchText(buildSearchText(session, msg), terms);
+    const match = matchText(buildSearchText(session, msg), queryPlan);
     const score = match.score;
     if (score <= 0) continue;
     hits.push({
       score,
       matchedTerms: match.matchedTerms,
+      hitType: "content",
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -608,7 +765,7 @@ function searchTranscriptNode(session, terms, opts) {
       role: msg.role,
       line: i + 1,
       timestamp: msg.timestamp,
-      snippet: snippet(msg.text, terms, opts.maxChars),
+      snippet: snippet(msg.text, queryPlan.terms, opts.maxChars),
     });
   }
   return hits;
@@ -683,7 +840,7 @@ function runRgBatch({ rgCommand, terms, files, timeoutMs }) {
   });
 }
 
-function parseRgMatches(stdout, sessionByFile, terms, opts) {
+function parseRgMatches(stdout, sessionByFile, queryPlan, opts) {
   const hits = [];
   for (const rawLine of stdout.split(/\r?\n/)) {
     if (!rawLine.trim()) continue;
@@ -704,11 +861,13 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
     if (!SEARCHABLE_ROLES.has(msg.role)) continue;
     if (!opts.includeAssistant && msg.role === "assistant") continue;
     if (opts.excludePluginOutputs && msg.role === "assistant" && isPluginGeneratedTranscriptText(msg.text)) continue;
-    const match = matchText(buildSearchText(session, msg), terms);
+    const match = matchText(buildSearchText(session, msg), queryPlan);
     const score = match.score;
+    if (score <= 0) continue;
     hits.push({
-      score: score > 0 ? score : 1,
+      score,
       matchedTerms: match.matchedTerms,
+      hitType: "content",
       key: session.key,
       label: session.label,
       sessionId: session.sessionId,
@@ -718,13 +877,13 @@ function parseRgMatches(stdout, sessionByFile, terms, opts) {
       role: msg.role,
       line: Number(event.data?.line_number || 0),
       timestamp: msg.timestamp,
-      snippet: snippet(msg.text, terms, opts.maxChars),
+      snippet: snippet(msg.text, queryPlan.terms, opts.maxChars),
     });
   }
   return hits;
 }
 
-async function searchWithRg(sessions, terms, opts) {
+async function searchWithRg(sessions, queryPlan, opts) {
   const rgCommand = findRgCommand();
   const rgSessions = sessions.filter((session) => !session.tailOnly);
   const tailSessions = sessions.filter((session) => session.tailOnly);
@@ -739,18 +898,18 @@ async function searchWithRg(sessions, terms, opts) {
   for (const batch of chunkArray(files, opts.rgBatchSize)) {
     const result = await runRgBatch({
       rgCommand,
-      terms,
+      terms: queryPlan.rgTerms,
       files: batch,
       timeoutMs: opts.timeoutMs,
     });
     if (result.timedOut) timedOut = true;
     if (!result.ok) failed = true;
     if (result.stderr) stderr = result.stderr.slice(0, 1000);
-    hits.push(...parseRgMatches(result.stdout, sessionByFile, terms, opts));
+    hits.push(...parseRgMatches(result.stdout, sessionByFile, queryPlan, opts));
     if (hits.length >= opts.limit * 8 || timedOut || failed) break;
   }
   if (!timedOut && !failed && hits.length < opts.limit * 8 && tailSessions.length > 0) {
-    hits.push(...searchWithNode(tailSessions, terms, opts).hits);
+    hits.push(...searchWithNode(tailSessions, queryPlan, opts).hits);
   }
   return {
     hits,
@@ -779,6 +938,8 @@ function buildSearchText(session, msg) {
     msg.text,
     session.key,
     session.label,
+    session.agentName,
+    session.agentId,
     session.sessionId,
     formatSearchTimestamp(msg.timestamp),
     formatSearchTimestamp(session.createdAt),
@@ -793,6 +954,8 @@ function buildSessionMetadataSearchText(session) {
     session.key,
     session.label,
     session.displayName,
+    session.agentName,
+    session.agentId,
     session.sessionId,
     formatSearchTimestamp(session.createdAt),
     formatSearchTimestamp(session.lastMessageAt),
@@ -802,12 +965,35 @@ function buildSessionMetadataSearchText(session) {
     .join("\n");
 }
 
-function searchSessionMetadata(session, terms, opts) {
-  const match = matchText(buildSessionMetadataSearchText(session), terms);
+function buildSessionMetadataFields(session) {
+  return [
+    { field: "key", value: session.key },
+    { field: "title", value: session.label || session.displayName },
+    { field: "sessionId", value: session.sessionId },
+    { field: "agentName", value: session.agentName },
+    { field: "agentId", value: session.agentId },
+    { field: "createdAt", value: formatSearchTimestamp(session.createdAt) },
+    { field: "lastMessageAt", value: formatSearchTimestamp(session.lastMessageAt) },
+    { field: "updatedAt", value: formatSearchTimestamp(session.updatedAt) },
+  ].filter((item) => item.value);
+}
+
+function metadataMatchesForSession(session, queryPlan) {
+  return buildSessionMetadataFields(session)
+    .filter((item) => matchText(String(item.value), queryPlan).score > 0)
+    .map((item) => ({ field: item.field, value: singleLine(item.value, 160) }));
+}
+
+function searchSessionMetadata(session, queryPlan, opts) {
+  const match = matchText(buildSessionMetadataSearchText(session), queryPlan);
   if (match.score <= 0) return null;
+  const metadataMatches = metadataMatchesForSession(session, queryPlan);
+  const firstMatch = metadataMatches[0];
   return {
     score: match.score,
     matchedTerms: match.matchedTerms,
+    hitType: "metadata",
+    metadataMatches,
     key: session.key,
     label: session.label,
     sessionId: session.sessionId,
@@ -817,8 +1003,19 @@ function searchSessionMetadata(session, terms, opts) {
     role: "system",
     line: 0,
     timestamp: session.lastMessageAt || session.updatedAt || session.createdAt,
-    snippet: snippet(buildSessionMetadataSearchText(session), terms, opts.maxChars),
+    snippet: firstMatch ? `${metadataFieldLabel(firstMatch.field)}：${firstMatch.value}` : session.lastMessagePreview || session.displayName || session.sessionId,
   };
+}
+
+function metadataFieldLabel(field) {
+  if (field === "title") return "标题匹配";
+  if (field === "agentName") return "Agent 匹配";
+  if (field === "agentId") return "Agent ID 匹配";
+  if (field === "sessionId") return "Session ID 匹配";
+  if (field === "createdAt") return "创建时间匹配";
+  if (field === "lastMessageAt") return "最近交流时间匹配";
+  if (field === "updatedAt") return "更新时间匹配";
+  return "元数据匹配";
 }
 
 function formatSearchTimestamp(value) {
@@ -839,7 +1036,50 @@ function formatSearchTimestamp(value) {
   ].join(" ");
 }
 
-function groupHitsBySession(hits) {
+function normalizeSessionLabel(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^<agent:[^>]+>\s*/, "").trim();
+}
+
+function sessionDisplayName(session) {
+  return normalizeSessionLabel(session.label) || session.key || session.sessionId || "session";
+}
+
+function hitSortTime(hit) {
+  return Number(hit?.timestamp || hit?.lastMessageAt || hit?.updatedAt || 0);
+}
+
+function scoreSessionHits(hits) {
+  const sorted = [...hits].sort(
+    (a, b) =>
+      Number(b.matchedTerms || 0) - Number(a.matchedTerms || 0) ||
+      Number(b.score || 0) - Number(a.score || 0) ||
+      hitSortTime(b) - hitSortTime(a),
+  );
+  const bestHit = sorted[0];
+  const topHitScore = sorted
+    .slice(1, 4)
+    .reduce((sum, hit) => sum + Number(hit.score || 0) * 0.25, 0);
+  return {
+    bestHit,
+    bestMatchedTerms: Number(bestHit?.matchedTerms || 0),
+    sessionScore:
+      Number(bestHit?.score || 0) + topHitScore + Math.log1p(sorted.length) * 2,
+    lastHitAt: sorted.reduce((latest, hit) => Math.max(latest, hitSortTime(hit)), 0),
+    hits: sorted,
+  };
+}
+
+function compareSessionGroups(a, b) {
+  return (
+    Number(b.bestMatchedTerms || 0) - Number(a.bestMatchedTerms || 0) ||
+    Number(b.sessionScore || 0) - Number(a.sessionScore || 0) ||
+    Number(b.lastHitAt || 0) - Number(a.lastHitAt || 0) ||
+    Number(b.updatedAt || 0) - Number(a.updatedAt || 0)
+  );
+}
+
+function groupHitsBySession(hits, maxHitsPerSession = 2) {
   const groups = [];
   const byKey = new Map();
   for (const hit of hits) {
@@ -849,27 +1089,40 @@ function groupHitsBySession(hits) {
       group = {
         key,
         label: hit.label,
+        agentId: hit.agentId,
+        agentName: hit.agentName,
+        displayName: hit.displayName,
         sessionId: hit.sessionId,
         updatedAt: hit.updatedAt,
         createdAt: hit.createdAt,
         lastMessageAt: hit.lastMessageAt,
         hitCount: 0,
-        bestHit: hit,
-        hits: [],
+        allHits: [],
       };
       byKey.set(key, group);
       groups.push(group);
     }
     group.hitCount += 1;
-    if (group.hits.length < 3) group.hits.push(hit);
+    group.allHits.push(hit);
   }
-  return groups;
+  return groups.map((group) => {
+    const scored = scoreSessionHits(group.allHits);
+    return {
+      ...group,
+      bestHit: scored.bestHit,
+      bestMatchedTerms: scored.bestMatchedTerms,
+      sessionScore: scored.sessionScore,
+      lastHitAt: scored.lastHitAt,
+      hits: scored.hits.slice(0, maxHitsPerSession),
+      allHits: undefined,
+    };
+  });
 }
 
-function searchWithNode(sessions, terms, opts) {
+function searchWithNode(sessions, queryPlan, opts) {
   return {
     hits: sessions.flatMap((session) =>
-      searchTranscriptNode(session, terms, {
+      searchTranscriptNode(session, queryPlan, {
         includeAssistant: opts.includeAssistant,
         excludePluginOutputs: opts.excludePluginOutputs,
         maxChars: opts.maxChars,
@@ -908,231 +1161,89 @@ function roleLabel(role) {
   return role || "未知";
 }
 
-function stripKnownChannelPrefix(channel, value) {
-  const text = typeof value === "string" ? value.trim() : "";
-  if (!text) return "";
-  const prefix = `${String(channel ?? "").trim().toLowerCase()}:`;
-  return prefix && text.toLowerCase().startsWith(prefix) ? text.slice(prefix.length) : text;
+function publicHit(hit, session, opts) {
+  const result = {
+    hitType: hit.hitType || "content",
+    role: hit.role,
+    line: hit.line,
+    timestamp: hit.timestamp,
+    snippet: cleanDisplaySnippet(hit.snippet, opts.query),
+  };
+  if (hit.hitType === "content") {
+    result.context = hit.context || buildHitContext(session, hit, opts);
+  }
+  return result;
 }
 
-function resolveCommandConversation(ctx) {
-  const channel = String(ctx.channel ?? ctx.channelId ?? "").trim().toLowerCase();
-  if (!channel) return null;
-  const accountId = String(ctx.accountId ?? "default").trim() || "default";
-  const rawConversation =
-    typeof ctx.to === "string" && ctx.to.trim()
-      ? ctx.to
-      : typeof ctx.from === "string" && ctx.from.trim()
-        ? ctx.from
-        : typeof ctx.senderId === "string" && ctx.senderId.trim()
-          ? `user:${ctx.senderId.trim()}`
-          : "";
-  const conversationId = stripKnownChannelPrefix(channel, rawConversation);
-  if (!conversationId) return null;
-  const parentConversationId =
-    typeof ctx.threadParentId === "string" && ctx.threadParentId.trim()
-      ? stripKnownChannelPrefix(channel, ctx.threadParentId)
-      : undefined;
+function buildHitContext(session, hit, opts) {
+  const beforeCount = Math.max(0, Number(opts.contextBefore || 0));
+  const afterCount = Math.max(0, Number(opts.contextAfter || 0));
+  if (hit.hitType !== "content" || (beforeCount === 0 && afterCount === 0)) {
+    return { before: [], after: [] };
+  }
+  const messages = readSearchableTranscriptMessages(session.sessionFile, opts);
+  const index = messages.findIndex((item) => item.line === hit.line);
+  if (index < 0) return { before: [], after: [] };
+  const toContextItem = ({ msg }) => ({
+    role: msg.role,
+    text: singleLine(msg.text, opts.contextMaxChars),
+  });
   return {
-    channel,
-    accountId,
-    conversationId:
-      typeof ctx.messageThreadId === "string" || typeof ctx.messageThreadId === "number"
-        ? String(ctx.messageThreadId)
-        : conversationId,
-    ...(parentConversationId ? { parentConversationId } : {}),
+    before: messages.slice(Math.max(0, index - beforeCount), index).map(toContextItem),
+    after: messages.slice(index + 1, index + 1 + afterCount).map(toContextItem),
   };
 }
 
-function resolveOpenClawDistDir() {
-  const candidates = [
-    process.env.OPENCLAW_DIST_DIR,
-    "/usr/lib/node_modules/openclaw/dist",
-    path.join(process.cwd(), "dist"),
-  ].filter(Boolean);
-  return candidates.find((candidate) => {
-    try {
-      return fs.existsSync(candidate) && fs.statSync(candidate).isDirectory();
-    } catch {
-      return false;
-    }
-  });
+function buildSessionResult(group, sessionsByKey, opts) {
+  const session = sessionsByKey.get(group.key) || {};
+  const contentHits = group.hits.filter((hit) => hit.hitType !== "metadata");
+  const metadataHits = group.hits.filter((hit) => hit.hitType === "metadata");
+  const publicHits = contentHits.slice(0, opts.maxHitsPerSession).map((hit) => publicHit(hit, session, opts));
+  const metadataMatches = uniqueMetadataMatches(
+    metadataHits.flatMap((hit) => hit.metadataMatches || []),
+  );
+  const bestContentHit = contentHits[0];
+  const fallbackSnippet =
+    session.lastMessagePreview ||
+    metadataHits[0]?.snippet ||
+    group.bestHit?.snippet ||
+    group.label ||
+    group.sessionId ||
+    group.key;
+  const snippetText = bestContentHit
+    ? cleanDisplaySnippet(bestContentHit.snippet, opts.query)
+    : cleanDisplaySnippet(fallbackSnippet, opts.query);
+  return {
+    key: group.key,
+    label: group.label,
+    agentId: group.agentId || session.agentId,
+    agentName: session.agentName || group.agentName || group.agentId || session.agentId || "main",
+    displayName: group.displayName || group.label || group.key || group.sessionId || "session",
+    title: group.displayName || group.label || group.key || group.sessionId || "session",
+    sessionId: group.sessionId,
+    updatedAt: group.updatedAt,
+    createdAt: group.createdAt,
+    lastMessageAt: group.lastMessageAt,
+    snippet: snippetText,
+    hitCount: group.hitCount,
+    hits: publicHits,
+    metadataMatches,
+  };
 }
 
-async function importOpenClawInternalChunk(prefix) {
-  const distDir = resolveOpenClawDistDir();
-  if (!distDir) return null;
-  const direct = path.join(distDir, `${prefix}.js`);
-  const file = fs.existsSync(direct)
-    ? direct
-    : fs.readdirSync(distDir).find((name) => name.startsWith(`${prefix}-`) && name.endsWith(".js"));
-  if (!file) return null;
-  const filePath = path.isAbsolute(file) ? file : path.join(distDir, file);
-  return import(pathToFileURL(filePath).href);
-}
-
-async function getCoreSessionBindingService() {
-  const mod = await importOpenClawInternalChunk("session-binding-service");
-  const getter = mod?.getSessionBindingService ?? mod?.r;
-  return typeof getter === "function" ? getter() : null;
-}
-
-function formatNamedSessionsReply(sessions, stats) {
-  if (!sessions.length) {
-    return "可恢复会话：0 个\n\n没有找到用户可见会话。";
+function uniqueMetadataMatches(matches) {
+  const seen = new Set();
+  const result = [];
+  for (const match of matches) {
+    const field = String(match?.field || "");
+    const value = singleLine(match?.value || "", 160);
+    if (!field || !value) continue;
+    const key = `${field}\u0000${value}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ field, value });
   }
-  const lines = [
-    `可恢复会话：${sessions.length} 个`,
-    `范围：可见会话 ${stats.visibleSessions} 个`,
-    "",
-  ];
-  sessions.slice(0, 20).forEach((session, index) => {
-    lines.push(`--- ${index + 1}/${Math.min(sessions.length, 20)} ---`);
-    lines.push(`会话：${singleLine(session.displayName || sessionDisplayName(session), 80)}`);
-    if (session.key && session.key !== session.displayName) {
-      lines.push(`恢复ID：${singleLine(session.key, 96)}`);
-    }
-    const created = formatTime(session.createdAt);
-    const last = formatTime(session.lastMessageAt || session.updatedAt);
-    if (created) lines.push(`创建：${created}`);
-    if (last) lines.push(`最近交流：${last}`);
-    if (session.lastMessagePreview) lines.push(`最近：${singleLine(session.lastMessagePreview, 120)}`);
-    lines.push("");
-  });
-  if (sessions.length > 20) lines.push(`还有 ${sessions.length - 20} 个未展示，请输入更精确的会话或恢复ID。`);
-  lines.push("使用：/resume <会话或恢复ID>");
-  return lines.join("\n");
-}
-
-function formatResumeSuccessReply(session, binding) {
-  return [
-    `已恢复会话：${session.displayName || sessionDisplayName(session)}`,
-    "",
-    `恢复ID：${session.key}`,
-    binding?.bindingId ? `绑定：${binding.bindingId}` : "",
-    "后续消息会继续进入这个会话。",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-async function sessionResume(params, cfg) {
-  const agentId = normalizeAgentId(params.agentId);
-  const labelRaw = typeof params.label === "string" ? params.label : "";
-  if (!labelRaw.trim()) {
-    return {
-      action: "list",
-      ...listResumableSessions(agentId, cfg, { maxSessions: cfg.maxSessions }),
-    };
-  }
-  const parsed = parseSessionResumeLabel(labelRaw);
-  if (!parsed.ok) {
-    return { action: "error", code: "invalid_label", message: parsed.error };
-  }
-  const resolved = resolveResumableSession(agentId, parsed.label, cfg);
-  if (!resolved.ok) {
-    return {
-      action: "error",
-      code: resolved.code,
-      message:
-        resolved.code === "ambiguous"
-          ? `可恢复会话不唯一：${parsed.label}`
-          : `找不到可恢复会话：${parsed.label}`,
-      matches: resolved.matches?.map((session) => ({
-        key: session.key,
-        label: session.label,
-        displayName: session.displayName,
-        updatedAt: session.updatedAt,
-      })),
-    };
-  }
-  const conversation = params.conversation ?? null;
-  if (!conversation?.channel || !conversation?.conversationId) {
-    return {
-      action: "error",
-      code: "conversation_unavailable",
-      message: "/resume 必须在可绑定的会话里执行。",
-    };
-  }
-  const service = await getCoreSessionBindingService();
-  if (!service?.bind || !service?.getCapabilities) {
-    return {
-      action: "error",
-      code: "binding_service_unavailable",
-      message: "当前 OpenClaw 运行时没有暴露会话绑定服务。",
-    };
-  }
-  const capabilities = service.getCapabilities({
-    channel: conversation.channel,
-    accountId: conversation.accountId ?? "default",
-  });
-  if (
-    !capabilities?.adapterAvailable ||
-    !capabilities.bindSupported ||
-    !capabilities.placements?.includes("current")
-  ) {
-    return {
-      action: "error",
-      code: "binding_unavailable",
-      message: `当前通道不支持会话绑定：${conversation.channel}:${conversation.accountId ?? "default"}`,
-      capabilities,
-    };
-  }
-  const senderId = typeof params.senderId === "string" ? params.senderId.trim() : "";
-  const existing = service.resolveByConversation?.(conversation);
-  const boundBy = typeof existing?.metadata?.boundBy === "string" ? existing.metadata.boundBy.trim() : "";
-  if (existing && boundBy && boundBy !== "system" && senderId && senderId !== boundBy) {
-    return {
-      action: "error",
-      code: "owned_by_other_sender",
-      message: `当前会话只能由 ${boundBy} 恢复。`,
-    };
-  }
-  try {
-    const targetAgentId = parseAgentIdFromSessionKey(resolved.session.key);
-    const displayName = resolved.session.displayName || sessionDisplayName(resolved.session);
-    const binding = await service.bind({
-      targetSessionKey: resolved.session.key,
-      targetKind: "session",
-      conversation,
-      placement: "current",
-      metadata: {
-        threadName: `OpenClaw ${targetAgentId}/${displayName}`,
-        introText: `Resumed session ${displayName}.`,
-        agentId: targetAgentId,
-        label: displayName,
-        boundBy: senderId || "unknown",
-      },
-    });
-    return {
-      action: "resume",
-      session: resolved.session,
-      binding,
-    };
-  } catch (error) {
-    return {
-      action: "error",
-      code: "bind_failed",
-      message: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function formatSessionResumeCommandReply(result) {
-  if (result.action === "list") {
-    return formatNamedSessionsReply(result.sessions, result.stats);
-  }
-  if (result.action === "resume") {
-    return formatResumeSuccessReply(result.session, result.binding);
-  }
-  const lines = [`恢复会话失败：${result.message || result.code || "unknown"}`];
-  if (Array.isArray(result.matches) && result.matches.length > 0) {
-    lines.push("", "候选会话：");
-    result.matches.slice(0, 10).forEach((session, index) => {
-      lines.push(`${index + 1}. ${session.displayName || session.label || session.key}`);
-    });
-  }
-  return lines.join("\n");
+  return result;
 }
 
 function cleanDisplaySnippet(value, query) {
@@ -1147,30 +1258,71 @@ function cleanDisplaySnippet(value, query) {
   return singleLine(text, 96);
 }
 
+function parseSessionSearchCommandArgs(args) {
+  const tokens = String(args ?? "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  let agentId = "";
+  const queryParts = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token === "--agent" || token === "--agent-id" || token === "--agentId") {
+      agentId = tokens[index + 1] || "";
+      index += 1;
+      continue;
+    }
+    const match = token.match(/^agentId=(.+)$/i) || token.match(/^agent=(.+)$/i);
+    if (match) {
+      agentId = match[1];
+      continue;
+    }
+    queryParts.push(token);
+  }
+  return {
+    query: queryParts.join(" ").trim(),
+    agentId: agentId.trim(),
+  };
+}
+
 function formatSessionSearchCommandReply(result) {
   const filtered =
     result.filteredSubagent + result.filteredCron + result.filteredTool + result.filteredInternal;
+  const sessions = Array.isArray(result.results) ? result.results : [];
+  const hitCount = Number(result.hitCount ?? 0);
+  const agentCount = Array.isArray(result.agentsSearched) ? result.agentsSearched.length : 1;
   const lines = [
     `历史会话搜索：${result.query}`,
     "",
-    `结果 ${result.count} 条 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
+    `结果 ${sessions.length} 个会话 | 命中 ${hitCount} 次 | agent ${agentCount} 个 | 可见会话 ${result.searchedFiles} 个 | 过滤 ${filtered} 个 | ${result.tookMs}ms (${result.backend})`,
   ];
-  if (!Array.isArray(result.results) || result.results.length === 0) {
+  if (!sessions.length) {
     lines.push("", "未找到匹配的用户可见会话。");
     return lines.join("\n");
   }
   lines.push("");
-  result.results.forEach((item, index) => {
-    const hitTime = formatTime(item.timestamp);
+  sessions.forEach((item, index) => {
     const lastTime = formatTime(item.lastMessageAt || item.updatedAt);
-    const label = item.label || item.key || item.sessionId || "session";
-    lines.push(`--- ${index + 1}/${result.results.length} ---`);
-    lines.push(`会话：${singleLine(label, 56)}`);
-    if (item.key && item.key !== label) lines.push(`恢复ID：${singleLine(item.key, 96)}`);
-    if (hitTime) lines.push(`命中时间：${hitTime}`);
-    if (lastTime && lastTime !== hitTime) lines.push(`最近交流：${lastTime}`);
-    lines.push(`角色：${roleLabel(item.role)}`);
-    lines.push(`片段：${cleanDisplaySnippet(item.snippet, result.query)}`);
+    const displayName = item.displayName || item.label || item.key || item.sessionId || "session";
+    const recentHits = Array.isArray(item.hits) ? item.hits.slice(0, 2) : [];
+    lines.push(`--- ${index + 1}/${sessions.length} ---`);
+    if (item.agentId) lines.push(`Agent：${singleLine(item.agentId, 48)}`);
+    lines.push(`会话：${singleLine(displayName, 56)}`);
+    lines.push(`命中次数：${item.hitCount || recentHits.length}`);
+    if (item.key && item.key !== displayName) lines.push(`会话ID：${singleLine(item.key, 96)}`);
+    if (lastTime) lines.push(`最近交流：${lastTime}`);
+    if (recentHits.length > 0) {
+      lines.push("最近命中：");
+      recentHits.forEach((hit, hitIndex) => {
+        const hitTime = formatTime(hit.timestamp);
+        const hitParts = [
+          hitTime || "未知时间",
+          roleLabel(hit.role),
+          cleanDisplaySnippet(hit.snippet, result.query),
+        ].filter(Boolean);
+        lines.push(`  ${hitIndex + 1}. ${hitParts.join(" | ")}`);
+      });
+    }
     lines.push("");
   });
   return lines.join("\n");
@@ -1194,6 +1346,10 @@ async function sessionSearch(params, cfg) {
   const sinceDays = clampInt(params.sinceDays, cfg.sinceDays, 0, 3650);
   const timeoutMs = clampInt(params.timeoutMs, cfg.timeoutMs, 100, 60000);
   const rgBatchSize = clampInt(params.rgBatchSize, cfg.rgBatchSize, 1, 500);
+  const maxHitsPerSession = clampInt(params.maxHitsPerSession, cfg.maxHitsPerSession, 1, 10);
+  const contextBefore = clampInt(params.contextBefore, cfg.contextBefore, 0, 5);
+  const contextAfter = clampInt(params.contextAfter, cfg.contextAfter, 0, 5);
+  const contextMaxChars = clampInt(params.contextMaxChars, cfg.contextMaxChars, 80, 2000);
   const includeCron = typeof params.includeCron === "boolean" ? params.includeCron : cfg.includeCron;
   const includeSubagents =
     typeof params.includeSubagents === "boolean" ? params.includeSubagents : cfg.includeSubagents;
@@ -1203,8 +1359,9 @@ async function sessionSearch(params, cfg) {
     typeof params.includeAssistant === "boolean"
       ? params.includeAssistant
       : cfg.includeAssistantByDefault;
-  const terms = Array.from(new Set(tokenize(query)));
-  if (terms.length === 0) throw new Error("query has no searchable terms");
+  const agentName = agentNameForId(agentId);
+  const queryPlan = buildQueryPlan(query);
+  if (queryPlan.terms.length === 0) throw new Error("query has no searchable terms");
   const listed = listSessionEntries(agentId, {
     maxSessions,
     sinceDays,
@@ -1217,7 +1374,10 @@ async function sessionSearch(params, cfg) {
     maxFiles,
     sessionsDir: sessionsDirForAgent(agentId),
   });
-  const selectedSessions = attachTranscriptSummaries(selected.sessions);
+  const selectedSessions = attachTranscriptSummaries(
+    selected.sessions.map((session) => ({ ...session, agentId, agentName })),
+  );
+  const sessionsByKey = new Map(selectedSessions.map((session) => [session.key, session]));
   const searchOpts = {
     limit,
     includeAssistant,
@@ -1225,18 +1385,22 @@ async function sessionSearch(params, cfg) {
     maxTranscriptBytes,
     timeoutMs,
     rgBatchSize,
+    contextBefore,
+    contextAfter,
+    contextMaxChars,
+    maxHitsPerSession,
     excludePluginOutputs: cfg.excludePluginOutputs,
   };
   let search =
     cfg.backend === "rg"
-      ? await searchWithRg(selectedSessions, terms, searchOpts)
-      : searchWithNode(selectedSessions, terms, searchOpts);
+      ? await searchWithRg(selectedSessions, queryPlan, searchOpts)
+      : searchWithNode(selectedSessions, queryPlan, searchOpts);
   if (search.meta.failed && cfg.fallbackToNode) {
-    search = searchWithNode(selectedSessions, terms, searchOpts);
+    search = searchWithNode(selectedSessions, queryPlan, searchOpts);
     search.meta.fallbackFrom = "rg";
   }
   const metadataHits = selectedSessions
-    .map((session) => searchSessionMetadata(session, terms, searchOpts))
+    .map((session) => searchSessionMetadata(session, queryPlan, searchOpts))
     .filter(Boolean);
   const sortedHits = search.hits
     .concat(metadataHits)
@@ -1247,8 +1411,9 @@ async function sessionSearch(params, cfg) {
         Number(b.timestamp || b.lastMessageAt || b.updatedAt || 0) -
           Number(a.timestamp || a.lastMessageAt || a.updatedAt || 0),
     );
-  const results = sortedHits.slice(0, limit);
-  const sessionGroups = groupHitsBySession(sortedHits).slice(0, limit);
+  const rankedGroups = groupHitsBySession(sortedHits, Math.max(maxHitsPerSession, 10))
+    .sort(compareSessionGroups)
+    .slice(0, limit);
   return {
     query,
     agentId,
@@ -1260,6 +1425,7 @@ async function sessionSearch(params, cfg) {
     skippedMissing: selected.skippedMissing,
     skippedLarge: selected.skippedLarge,
     skippedUnsafePath: selected.skippedUnsafePath,
+    skippedIgnoredTranscript: selected.skippedIgnoredTranscript,
     filteredSubagent: listed.stats.filteredSubagent,
     filteredCron: listed.stats.filteredCron,
     filteredTool: listed.stats.filteredTool,
@@ -1267,10 +1433,29 @@ async function sessionSearch(params, cfg) {
     sinceDays,
     maxTranscriptBytes,
     tookMs: Date.now() - startedAt,
-    count: results.length,
-    results,
-    sessionGroupCount: sessionGroups.length,
-    sessionGroups,
+    count: rankedGroups.length,
+    hitCount: sortedHits.length,
+    results: rankedGroups.map((group) =>
+      buildSessionResult(
+        {
+          ...group,
+          agentId,
+          agentName,
+          displayName: group.label || group.key || group.sessionId || "session",
+        },
+        sessionsByKey,
+        {
+          query,
+          includeAssistant,
+          excludePluginOutputs: cfg.excludePluginOutputs,
+          maxTranscriptBytes,
+          contextBefore,
+          contextAfter,
+          contextMaxChars,
+          maxHitsPerSession,
+        },
+      ),
+    ),
     debug: {
       ...search.meta,
       stderr: search.meta.stderr || undefined,
@@ -1278,24 +1463,93 @@ async function sessionSearch(params, cfg) {
   };
 }
 
+async function sessionSearchAllAgents(params, cfg) {
+  const startedAt = Date.now();
+  const query = typeof params.query === "string" ? params.query.trim() : "";
+  if (!query) throw new Error("query is required");
+  const limit = clampInt(params.limit, cfg.defaultLimit, 1, 50);
+  const agentIds = configuredAgentIds();
+  const perAgentLimit = Math.max(limit, 5);
+  const results = await Promise.all(
+    agentIds.map((agentId) =>
+      sessionSearch(
+        {
+          ...params,
+          agentId,
+          limit: perAgentLimit,
+        },
+        cfg,
+      ),
+    ),
+  );
+  const mergedResults = results
+    .flatMap((result) => (Array.isArray(result.results) ? result.results : []))
+    .sort(
+      (a, b) =>
+        Number(b.hitCount || 0) - Number(a.hitCount || 0) ||
+        Number(b.lastMessageAt || b.updatedAt || 0) - Number(a.lastMessageAt || a.updatedAt || 0),
+    )
+    .slice(0, limit);
+  const backends = Array.from(new Set(results.map((result) => result.backend).filter(Boolean)));
+  return {
+    query,
+    agentId: "all",
+    agentsSearched: agentIds,
+    backend: backends.join("+") || cfg.backend,
+    candidateSessions: results.reduce((sum, result) => sum + Number(result.candidateSessions || 0), 0),
+    visibleSessions: results.reduce((sum, result) => sum + Number(result.visibleSessions || 0), 0),
+    searchedSessions: results.reduce((sum, result) => sum + Number(result.searchedSessions || 0), 0),
+    searchedFiles: results.reduce((sum, result) => sum + Number(result.searchedFiles || 0), 0),
+    skippedMissing: results.reduce((sum, result) => sum + Number(result.skippedMissing || 0), 0),
+    skippedLarge: results.reduce((sum, result) => sum + Number(result.skippedLarge || 0), 0),
+    skippedUnsafePath: results.reduce((sum, result) => sum + Number(result.skippedUnsafePath || 0), 0),
+    skippedIgnoredTranscript: results.reduce(
+      (sum, result) => sum + Number(result.skippedIgnoredTranscript || 0),
+      0,
+    ),
+    filteredSubagent: results.reduce((sum, result) => sum + Number(result.filteredSubagent || 0), 0),
+    filteredCron: results.reduce((sum, result) => sum + Number(result.filteredCron || 0), 0),
+    filteredTool: results.reduce((sum, result) => sum + Number(result.filteredTool || 0), 0),
+    filteredInternal: results.reduce((sum, result) => sum + Number(result.filteredInternal || 0), 0),
+    sinceDays: clampInt(params.sinceDays, cfg.sinceDays, 0, 3650),
+    maxTranscriptBytes: clampInt(
+      params.maxTranscriptBytes,
+      cfg.maxTranscriptBytes,
+      4096,
+      2 * 1024 * 1024,
+    ),
+    tookMs: Date.now() - startedAt,
+    count: mergedResults.length,
+    hitCount: results.reduce((sum, result) => sum + Number(result.hitCount || 0), 0),
+    results: mergedResults,
+    debug: {
+      agents: results.map((result) => ({
+        agentId: result.agentId,
+        searchedFiles: result.searchedFiles,
+        hitCount: result.hitCount,
+        backend: result.backend,
+      })),
+    },
+  };
+}
+
 export default definePluginEntry({
   id: "session-search",
   name: "Session Search",
-  description: "Low-frequency search over OpenClaw session transcripts.",
+  description:
+    "Explicit lookup over prior OpenClaw session transcripts; not a general search tool.",
   register(api) {
     api.registerGatewayMethod(
       "session-search.search",
       async ({ params, respond }) => {
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          respond(false, undefined, {
-            code: "disabled",
-            message: "session-search plugin is disabled",
-          });
-          return;
-        }
         try {
-          respond(true, await sessionSearch(asRecord(params), cfg));
+          const input = asRecord(params);
+          const result =
+            typeof input.agentId === "string" && input.agentId.trim()
+              ? await sessionSearch(input, cfg)
+              : await sessionSearchAllAgents(input, cfg);
+          respond(true, result);
         } catch (error) {
           respond(false, undefined, {
             code: "session_search_failed",
@@ -1306,51 +1560,59 @@ export default definePluginEntry({
       { scope: "operator.read" },
     );
 
-    api.registerGatewayMethod(
-      "session-search.resume",
-      async ({ params, respond }) => {
-        const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          respond(false, undefined, {
-            code: "disabled",
-            message: "session-search plugin is disabled",
-          });
-          return;
-        }
-        try {
-          respond(true, await sessionResume(asRecord(params), cfg));
-        } catch (error) {
-          respond(false, undefined, {
-            code: "session_resume_failed",
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      },
-      { scope: "operator.write" },
+    api.registerTool(
+      (ctx) => ({
+        name: "current_session_id",
+        label: "Current Session ID",
+        description:
+          "Returns the current OpenClaw session id/sessionKey from runtime context. Use before tools that require the current session id; no transcript search is performed.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {},
+        },
+        async execute() {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(currentSessionContext(ctx)),
+              },
+            ],
+          };
+        },
+      }),
+      { name: "current_session_id" },
     );
 
     api.registerTool(
       () => {
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) return null;
         return {
           name: "session_search",
           label: "Session Search",
           description:
-            "Search prior OpenClaw session transcripts. Use for low-frequency recall of previous conversations, tasks, decisions, or blocked work. This is independent from memory_recall and does not use the memory slot.",
+            "Use only when the user explicitly asks to search prior OpenClaw session transcripts or conversation history. Never use for general questions, web search, codebase search, document search, or ordinary knowledge lookup. Searches all active agents by default and is independent from memory_recall.",
           parameters: {
             type: "object",
             additionalProperties: false,
             required: ["query"],
             properties: {
               query: { type: "string", description: "Search query." },
-              agentId: { type: "string", description: "Agent id to search, default main." },
+              agentId: {
+                type: "string",
+                description: "Optional agent id to search. If omitted, searches all active agents.",
+              },
               limit: { type: "number", description: "Maximum results, default plugin config." },
               maxSessions: { type: "number", description: "Maximum recent sessions to scan." },
               maxFiles: { type: "number", description: "Maximum transcript files to scan." },
               sinceDays: { type: "number", description: "Only search sessions updated within N days." },
               timeoutMs: { type: "number", description: "Per-rg-batch timeout in milliseconds." },
               maxChars: { type: "number", description: "Maximum snippet chars." },
+              maxHitsPerSession: { type: "number", description: "Maximum content hits per session." },
+              contextBefore: { type: "number", description: "Visible transcript messages before each hit." },
+              contextAfter: { type: "number", description: "Visible transcript messages after each hit." },
+              contextMaxChars: { type: "number", description: "Maximum chars per context message." },
               maxTranscriptBytes: {
                 type: "number",
                 description: "Maximum bytes to scan from the tail of each transcript.",
@@ -1367,14 +1629,14 @@ export default definePluginEntry({
                 type: "boolean",
                 description: "Include subagent sessions. Defaults to false.",
               },
-              includeInternal: {
-                type: "boolean",
-                description: "Include tool/internal sessions. Defaults to false.",
-              },
             },
           },
           async execute(_toolCallId, params) {
-            const result = await sessionSearch(asRecord(params), cfg);
+            const input = asRecord(params);
+            const result =
+              typeof input.agentId === "string" && input.agentId.trim()
+                ? await sessionSearch(input, cfg)
+                : await sessionSearchAllAgents(input, cfg);
             return {
               content: [
                 {
@@ -1390,53 +1652,26 @@ export default definePluginEntry({
     );
 
     api.registerCommand({
-      name: "resume",
-      description: "List or resume named OpenClaw sessions",
-      acceptsArgs: true,
-      requireAuth: true,
-      async handler(ctx) {
-        const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          return { text: "Session resume is disabled." };
-        }
-        const result = await sessionResume(
-          {
-            label: typeof ctx.args === "string" ? ctx.args.trim() : "",
-            agentId: "main",
-            conversation: resolveCommandConversation(ctx),
-            senderId: ctx.senderId,
-          },
-          cfg,
-        );
-        return { text: formatSessionResumeCommandReply(result) };
-      },
-    });
-
-    api.registerCommand({
       name: "session-search",
       description: "Search user-visible OpenClaw session transcripts",
       acceptsArgs: true,
       requireAuth: true,
       async handler(ctx) {
-        const query = typeof ctx.args === "string" ? ctx.args.trim() : "";
+        const { query, agentId } = parseSessionSearchCommandArgs(ctx.args);
         if (!query) {
-          return { text: "Usage: /session-search <keyword>" };
+          return { text: "Usage: /session-search [--agent <agentId>] <keyword>" };
         }
         const cfg = resolveConfig(api.pluginConfig);
-        if (!cfg.enabled) {
-          return { text: "Session search is disabled." };
-        }
-        const result = await sessionSearch(
-          {
-            query,
-            agentId: "main",
-            sinceDays: cfg.sinceDays,
-            limit: Math.min(cfg.defaultLimit, 5),
-            maxChars: 240,
-            includeAssistant: cfg.includeAssistantByDefault,
-          },
-          cfg,
-        );
+        const input = {
+          query,
+          sinceDays: cfg.sinceDays,
+          limit: Math.min(cfg.defaultLimit, 5),
+          maxChars: 240,
+          includeAssistant: cfg.includeAssistantByDefault,
+        };
+        const result = agentId
+          ? await sessionSearch({ ...input, agentId }, cfg)
+          : await sessionSearchAllAgents(input, cfg);
         return { text: formatSessionSearchCommandReply(result) };
       },
     });
